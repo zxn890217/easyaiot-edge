@@ -70,7 +70,7 @@ services:
       - NACOS_PASSWORD=${NACOS_PASSWORD:-basiclab@iot78475418754}
       - SERVICE_NAME=${SERVICE_NAME:-video-server}
       # Pod IP配置（容器内会自动获取，也可手动指定）
-      - POD_IP=${POD_IP:-}
+      - POD_IP=127.0.0.1
       # MinIO对象存储配置（使用localhost，因为使用host网络模式）
       - MINIO_ENDPOINT=${MINIO_ENDPOINT:-localhost:9000}
       - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}

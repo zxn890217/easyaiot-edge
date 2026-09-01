@@ -200,6 +200,71 @@ def start_ffmpeg_transcode_relay(
     return _popen_relay(cmd, env, device_log, logger, device_id, 'ffmpeg-transcode')
 
 
+def _trigger_runtime_streaming_start(
+    control_port: int,
+    device_id: str,
+    logger,
+    *,
+    ready_timeout: float = 8.0,
+) -> bool:
+    """等待 RUNTIME control server 就绪后发送 /control/streaming/start。
+
+    RUNTIME 是 non-blocking 模式：启动后只监听 control port，
+    需要 POST /control/streaming/start 才会真正开始拉流推流。
+    """
+    import urllib.error
+    import urllib.request
+
+    base_url = f'http://127.0.0.1:{control_port}'
+
+    # 轮询 /health 等待 control server 就绪
+    deadline = time.time() + ready_timeout
+    ready = False
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(f'{base_url}/health', method='GET')
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                if resp.status == 200:
+                    ready = True
+                    break
+        except Exception:
+            time.sleep(0.3)
+    if not ready:
+        logger.error(
+            '设备 %s RUNTIME control server (port %s) 未就绪，放弃触发推流启动',
+            device_id, control_port,
+        )
+        return False
+
+    # 发送 POST /control/streaming/start 触发拉流推流
+    try:
+        req = urllib.request.Request(
+            f'{base_url}/control/streaming/start',
+            method='POST',
+            data=b'{}',
+            headers={'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode('utf-8', errors='replace')
+            if resp.status == 200:
+                logger.info(
+                    '设备 %s RUNTIME 推流已触发启动 (control_port=%s): %s',
+                    device_id, control_port, body,
+                )
+                return True
+            logger.error(
+                '设备 %s RUNTIME /control/streaming/start 返回 %s: %s',
+                device_id, resp.status, body,
+            )
+            return False
+    except Exception as e:
+        logger.error(
+            '设备 %s RUNTIME /control/streaming/start 请求失败: %s',
+            device_id, e,
+        )
+        return False
+
+
 def start_runtime_relay_process(
     task,
     device_id: str,
@@ -272,6 +337,8 @@ def start_runtime_relay_process(
     env['RUNTIME_BIN'] = runtime_bin
     env['RUNTIME_FORCE_CPU'] = 'true'
     env['RUNTIME_FORCE_SOFT_AV'] = 'true'
+    # 使用 RUNTIME 内置 libav remux（不依赖外部 ffmpeg 二进制；容器内通常未安装 ffmpeg）
+    env.setdefault('STREAM_FORWARD_RELAY_MODE', 'libav')
     lib_path = runtime_library_path_env()
     if lib_path:
         existing = (env.get('LD_LIBRARY_PATH') or '').strip()
@@ -285,6 +352,19 @@ def start_runtime_relay_process(
         device_id,
         f'RUNTIME forward copy -> {rtmp_url}',
     )
+
+    # RUNTIME 是 non-blocking 模式，需要 POST /control/streaming/start 触发拉流推流
+    if proc and proc.poll() is None:
+        try:
+            import configparser
+            cfg = configparser.ConfigParser()
+            cfg.read(ini_path, encoding='utf-8')
+            control_port = cfg.getint('task', 'control_port', fallback=0)
+        except Exception:
+            control_port = 0
+        if control_port:
+            _trigger_runtime_streaming_start(control_port, device_id, logger)
+
     return proc
 
 
