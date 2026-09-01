@@ -634,6 +634,71 @@ def _resolve_dir_to_onnx(model_dir: Path, default_names: Path) -> Optional[Tuple
     return None
 
 
+def _materialize_db_model(model_id: int, model_dir: Path) -> Optional[Path]:
+    """当 data/models/{id}/ 下没有可用的 onnx/pt 时，尝试从 AiModel.model_path
+    （MinIO-style URL）懒加载权重到 model_dir/model.{ext}。
+
+    local-storage 自身会优先用已有 flat 文件，缺失时从安装包种子目录懒加载，
+    因此 WEB 上传的模型（model_path 形如 /api/v1/buckets/models/objects/download
+    ?prefix=yolo/yolov26/{hash}.pt）在 cpp executor 下也能自动落地，无需手动 cp。
+
+    返回目标文件路径；失败返回 None（保留原 Agent 远程路径行为）。
+    """
+    try:
+        from models import AiModel
+    except Exception:
+        return None
+    try:
+        row = AiModel.query.get(model_id)
+    except Exception as exc:
+        logger.debug('materialize: AiModel.query.get(%s) failed: %s', model_id, exc)
+        return None
+    if not row or not (row.model_path or '').strip():
+        return None
+
+    model_path = (row.model_path or '').strip()
+    if not model_path.startswith('/api/v1/buckets/'):
+        return None
+
+    # /api/v1/buckets/{bucket}/objects/download?prefix={object_key}
+    parsed = urlparse(model_path)
+    parts = parsed.path.split('/')
+    bucket_name = None
+    for i, p in enumerate(parts):
+        if p == 'buckets' and i + 1 < len(parts):
+            bucket_name = parts[i + 1]
+            break
+    if not bucket_name:
+        return None
+    object_key = parse_qs(parsed.query).get('prefix', [None])[0]
+    if not object_key:
+        return None
+
+    try:
+        from app.services.local_storage_service import ensure_local_object
+    except Exception:
+        return None
+    src = ensure_local_object(bucket_name, object_key)
+    if not src or not os.path.isfile(src) or os.path.getsize(src) <= 0:
+        return None
+
+    import shutil
+    ext = os.path.splitext(object_key)[1].lower() or '.pt'
+    dest = model_dir / f'model{ext}'
+    try:
+        model_dir.mkdir(parents=True, exist_ok=True)
+        if not dest.is_file() or dest.stat().st_size != os.path.getsize(src):
+            shutil.copy2(src, dest)
+        logger.info(
+            '从 AiModel.model_path 懒加载模型文件: model_id=%s, %s/%s -> %s',
+            model_id, bucket_name, object_key, dest,
+        )
+        return dest
+    except OSError as exc:
+        logger.warning('懒加载模型文件失败 model_id=%s: %s', model_id, exc)
+        return None
+
+
 def _resolve_model_paths(task: AlgorithmTask, prefer_cluster: bool = False) -> Tuple[str, str]:
     """Resolve task.model_ids → (onnx_path, names_path) for RUNTIME.
 
@@ -705,6 +770,15 @@ def _resolve_model_paths(task: AlgorithmTask, prefer_cluster: bool = False) -> T
         if model_dir is not None:
             resolved = _resolve_dir_to_onnx(model_dir, default_names)
             if resolved:
+                # _resolve_dir_to_onnx 在目录缺失时会返回规范路径 model.onnx，
+                # 对集群 Agent 节点可保留（远程节点已存在），但本机 write_local 模式
+                # 下文件实际不存在——此时尝试从 AiModel.model_path（MinIO-style URL）
+                # 经 local-storage 懒加载权重到 model_dir/，再走正常 .pt → .onnx 导出。
+                if not os.path.isfile(resolved[0]):
+                    if _materialize_db_model(mid_int, model_dir):
+                        re_resolved = _resolve_dir_to_onnx(model_dir, default_names)
+                        if re_resolved:
+                            resolved = re_resolved
                 return resolved
 
     if prefer_cluster and remote_default_onnx.is_file():
