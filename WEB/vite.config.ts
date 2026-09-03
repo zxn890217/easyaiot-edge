@@ -87,6 +87,21 @@ export default ({ command, mode }: ConfigEnv): UserConfig => {
       // Turning off brotliSize display can slightly reduce packaging time
       reportCompressedSize: false,
       chunkSizeWarningLimit: 2000,
+      commonjsOptions: { include: [/node_modules/] },
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (id.includes('node_modules')) {
+              // Vue 全家桶 + ant-design-vue 放在一起，避免 defineComponent 等符号拆分断裂
+              if (/vue-router|vue-i18n|pinia|@vueuse|ant-design-vue/.test(id)) return 'vendor-framework'
+              // echarts 单独成 chunk（体积大且与框架无关）
+              if (id.includes('echarts')) return 'vendor-echarts'
+              // 其它第三方库统一归类
+              return 'vendor'
+            }
+          },
+        },
+      },
     },
     define: {
       __APP_INFO__: JSON.stringify(__APP_INFO__),
