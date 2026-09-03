@@ -223,7 +223,7 @@ int RknnEngine::LoadModel(const std::string& model_path,
                       << " (instance=" << options.instanceIndex << ")";
         }
 
-        rknn_io_num io_num{};
+        rknn_input_output_num io_num{};
         if (rknn_query(impl_->ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num)) != 0) {
             LOG(ERROR) << "[RKNN] RKNN_QUERY_IN_OUT_NUM failed";
             impl_->release();
