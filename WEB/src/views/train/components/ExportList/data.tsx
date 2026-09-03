@@ -1,10 +1,14 @@
 // src/views/export/components/exportModelColumns.ts
 import { BasicColumn } from '@/components/Table';
-import { Tag } from 'ant-design-vue';
 import { FormProps } from '@/components/Form';
 
 export function getExportModelColumns(): BasicColumn[] {
   return [
+    {
+      title: '模型名称',
+      dataIndex: 'model_name',
+      width: 160,
+    },
     {
       title: '模型ID',
       dataIndex: 'model_id',
@@ -24,12 +28,20 @@ export function getExportModelColumns(): BasicColumn[] {
       }
     },
     {
+      // 渲染交给 index.vue 的 #bodyCell（带颜色的 Tag）
       title: '导出格式',
-      dataIndex: 'export_format',
+      dataIndex: 'format',
+      width: 110,
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
       width: 100,
-      customRender: ({ text }) => (
-        <Tag>{text?.toUpperCase() || '--'}</Tag>
-      )
+    },
+    {
+      title: '文件大小',
+      dataIndex: 'size',
+      width: 110,
     },
     {
       title: '导出路径',
@@ -45,13 +57,9 @@ export function getExportModelColumns(): BasicColumn[] {
       }
     },
     {
-      title: '导出时间',
-      dataIndex: 'export_time',
-      width: 120,
-      customRender: ({ text }) => {
-        if (!text) return '--';
-        return new Date(text).toLocaleString();
-      }
+      title: '创建时间',
+      dataIndex: 'created_at',
+      width: 180,
     },
     {
       title: '操作',

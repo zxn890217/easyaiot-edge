@@ -9,7 +9,7 @@
         <Button 
           type="primary" 
           @click="handleExport"
-          :loading="exportLoading.onnx || exportLoading.openvino"
+          :loading="anyExportLoading"
           preIcon="ant-design:export-outlined"
         >
           导出模型
@@ -87,7 +87,7 @@
           <Button 
             type="primary" 
             @click="handleExport"
-            :loading="exportLoading.onnx || exportLoading.openvino"
+            :loading="anyExportLoading"
             preIcon="ant-design:export-outlined"
           >
             导出模型
@@ -140,12 +140,14 @@ const [registerExportModal, { openModal: openExportModal, closeModal: closeExpor
 
 // 格式标签映射
 const formatLabels: Record<string, string> = {
+  rknn: 'RKNN',
   onnx: 'ONNX',
   openvino: 'OpenVINO',
 };
 
 // 格式颜色映射
 const formatColors: Record<string, string> = {
+  rknn: 'purple',
   onnx: 'green',
   openvino: 'cyan',
 };
@@ -177,10 +179,12 @@ const state = reactive({
 // 数据状态
 const models = ref<any[]>([]);
 const modelOptions = ref<any[]>([]);
-const exportLoading = reactive({
+const exportLoading = reactive<Record<string, boolean>>({
+  rknn: false,
   onnx: false,
   openvino: false,
 });
+const anyExportLoading = computed(() => Object.values(exportLoading).some(Boolean));
 const pollingIntervals = ref<Map<number | string, NodeJS.Timeout>>(new Map());
 const modelsLoading = ref(false);
 const modelsLoaded = ref(false);
@@ -282,12 +286,12 @@ const getExportListApi = async (params: any) => {
       status: params.status || undefined,
       search: params.search || undefined,  // 支持按模型名称搜索
       page: params.page || 1,
-      per_page: params.pageSize || 10,
+      page_size: params.pageSize || 10,
     });
     
-    // transformResponseHook 会在 code === 0 时返回 data 部分
-    // 所以 res 应该是 { items: [...], total: ... } 格式
-    const data = res || {};
+    // 列表接口同时返回顶层 total 和 data.items，
+    // transformResponseHook 见到顶层 total 时会保留 data 包装：{ code, data, msg, total }
+    const data = res?.data ?? res ?? {};
     
     // 使用后端返回的model_name，如果没有则从模型列表中查找
     const items = (data.items || []).map((item: any) => {
@@ -388,9 +392,11 @@ const handleExport = () => {
 // 确认导出后执行实际导出
 const handleExportConfirm = async (data: {
   modelId: number;
-  format: 'onnx' | 'openvino';
+  format: string;
+  quantization?: boolean;
+  img_size?: number;
 }) => {
-  const { modelId, format } = data;
+  const { modelId, format, ...exportParams } = data;
 
   if (!modelId || !format) {
     createMessage.warning('请选择PT模型和导出格式');
@@ -399,12 +405,11 @@ const handleExportConfirm = async (data: {
 
   exportLoading[format] = true;
   try {
-    const res = await exportModel(modelId, format, {});
+    const res = await exportModel(modelId, format, exportParams);
     
-    // transformResponseHook 会在 code === 0 时返回 data 部分
-    // 所以 res 应该是 { task_id, export_id, ... } 格式
+    // 创建接口把导出记录放在非空 data 里，transformResponseHook 会直接解包成记录本身
     if (res) {
-      createMessage.success('导出任务已提交，请稍后刷新查看');
+      createMessage.success('导出任务已提交，正在转换中');
       
       // 关闭弹框
       closeExportModal();
@@ -413,11 +418,8 @@ const handleExportConfirm = async (data: {
       handleSuccess();
       
       // 开始轮询状态
-      const taskId = res.task_id;
-      const exportId = res.export_id;
-      if (taskId) {
-        startPollingByTaskId(taskId);
-      } else if (exportId) {
+      const exportId = res.export_id ?? res.id;
+      if (exportId) {
         startPolling(exportId);
       }
     } else {
@@ -435,8 +437,8 @@ const handleExportConfirm = async (data: {
   }
 };
 
-// 状态轮询（通过export_id）
-const startPolling = (exportId: number) => {
+// 状态轮询（导出记录的 ID 即轮询 ID）
+const startPolling = (exportId: number | string) => {
   if (pollingIntervals.value.has(exportId)) {
     clearInterval(pollingIntervals.value.get(exportId)!);
   }
@@ -445,14 +447,13 @@ const startPolling = (exportId: number) => {
     try {
       const statusRes = await getExportStatus(exportId);
       
-      // transformResponseHook 会在 code === 0 时返回 data 部分
-      // 所以 statusRes 应该是 { status, ... } 格式
+      // 状态接口把记录放在非空 data 里，transformResponseHook 会直接解包成记录本身
       if (statusRes && (statusRes.status === 'COMPLETED' || statusRes.status === 'FAILED')) {
         clearInterval(interval);
         pollingIntervals.value.delete(exportId);
         
         if (statusRes.status === 'FAILED') {
-          createMessage.error(`导出失败: ${statusRes.error || '未知错误'}`);
+          createMessage.error(`导出失败: ${statusRes.error_message || statusRes.errorMessage || '未知错误'}`);
         } else {
           createMessage.success('导出完成');
         }
@@ -461,42 +462,13 @@ const startPolling = (exportId: number) => {
       }
     } catch (error) {
       console.error('状态检查失败', error);
+      // 记录被删除等情况：停止轮询，避免定时器一直报错
+      clearInterval(interval);
+      pollingIntervals.value.delete(exportId);
     }
   }, 5000);
 
   pollingIntervals.value.set(exportId, interval);
-};
-
-// 状态轮询（通过task_id）
-const startPollingByTaskId = (taskId: string) => {
-  if (pollingIntervals.value.has(taskId)) {
-    clearInterval(pollingIntervals.value.get(taskId)!);
-  }
-
-  const interval = setInterval(async () => {
-    try {
-      const statusRes = await getExportStatus(taskId);
-      
-      // transformResponseHook 会在 code === 0 时返回 data 部分
-      // 所以 statusRes 应该是 { status, ... } 格式
-      if (statusRes && (statusRes.status === 'COMPLETED' || statusRes.status === 'FAILED')) {
-        clearInterval(interval);
-        pollingIntervals.value.delete(taskId);
-        
-        if (statusRes.status === 'FAILED') {
-          createMessage.error(`导出失败: ${statusRes.error || '未知错误'}`);
-        } else {
-          createMessage.success('导出完成');
-        }
-        
-        handleSuccess();
-      }
-    } catch (error) {
-      console.error('状态检查失败', error);
-    }
-  }, 5000);
-
-  pollingIntervals.value.set(taskId, interval);
 };
 
 // 下载导出文件
@@ -525,7 +497,8 @@ const handleDownload = async (record: any) => {
     link.href = url;
     
     // 从响应头或记录中获取文件名
-    const fileName = `${record.model_id || 'model'}_${record.format}.${getFileExtension(record.format)}`;
+    const baseName = String(record.model_name || `model${record.model_id ?? ''}`).replace(/[\\/:*?"<>|\s]+/g, '_');
+    const fileName = `${baseName}_${record.format}.${getFileExtension(record.format)}`;
     link.download = fileName;
     
     document.body.appendChild(link);
@@ -559,6 +532,7 @@ const handleDelete = async (record: any) => {
 // 获取文件扩展名
 const getFileExtension = (format: string): string => {
   const extensions: Record<string, string> = {
+    rknn: 'rknn',
     onnx: 'onnx',
     openvino: 'zip', // OpenVINO导出为目录，通常打包为zip
   };

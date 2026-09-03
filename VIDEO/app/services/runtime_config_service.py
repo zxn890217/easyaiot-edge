@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import re
 import subprocess
 import sys
 import threading
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -472,6 +474,85 @@ def _ensure_onnx_script() -> Path:
     return _repo_root() / 'RUNTIME' / 'scripts' / 'ensure_onnx_model.py'
 
 
+def _ensure_rknn_script() -> Path:
+    return _repo_root() / 'RUNTIME' / 'scripts' / 'ensure_rknn_model.py'
+
+
+#: 与 RUNTIME/src/InferEngine.cpp 的 hostHasRknn() 保持一致的 NPU 节点探测清单
+_NPU_DEVICE_NODES = (
+    '/dev/rga',
+    '/dev/rknpu',
+    '/dev/mpp_service',
+    '/dev/dri',
+    '/sys/class/devfreq/fdab0000.npu',
+    '/sys/class/devfreq/ff800000.npu',
+)
+_RKNNRT_LIB_CANDIDATES = (
+    '/usr/lib/librknnrt.so',
+    '/usr/local/lib/librknnrt.so',
+    '/usr/lib/aarch64-linux-gnu/librknnrt.so',
+    '/oem/usr/lib/librknnrt.so',
+    '/vendor/usr/lib/librknnrt.so',
+    '/opt/easyaiot/RUNTIME/lib/librknnrt.so',
+    # ensure_runtime_cpp.sh 把宿主机 librknnrt.so 所在目录挂到这里
+    '/opt/easyaiot/rknn-lib/librknnrt.so',
+)
+
+
+@lru_cache(maxsize=1)
+def rknn_host_available() -> bool:
+    """本机（控制面与 RUNTIME 同机部署时）是否具备 Rockchip NPU 运行时。"""
+    if platform.machine().lower() not in ('aarch64', 'arm64', 'armv8l'):
+        return False
+    if not any(os.path.exists(node) for node in _NPU_DEVICE_NODES):
+        return False
+    if any(os.path.isfile(lib) for lib in _RKNNRT_LIB_CANDIDATES):
+        return True
+    try:
+        import ctypes
+
+        ctypes.CDLL('librknnrt.so')
+        return True
+    except OSError:
+        return False
+
+
+def resolve_infer_backend(model_path: str = '') -> str:
+    """写入 ini `[ai] infer_backend` 的取值（onnx | rknn | auto）。
+
+    RUNTIME_INFER_BACKEND 显式覆盖优先；否则：已解析到 .rknn 产物就走 rknn，
+    其余留 auto——RUNTIME 侧只有在 librknnrt 可用且 .rknn 存在时才切 NPU。
+    """
+    override = (os.getenv('RUNTIME_INFER_BACKEND') or '').strip().lower()
+    if override in ('onnx', 'ort', 'cpu', 'gpu', 'cuda'):
+        return 'onnx'
+    if override in ('rknn', 'npu', 'rockchip', 'rknpu'):
+        return 'rknn'
+    if str(model_path or '').lower().endswith('.rknn'):
+        return 'rknn'
+    return 'auto'
+
+
+def resolve_npu_core_mask() -> str:
+    """写入 ini `[ai] npu_core_mask` 的取值（auto | all | per_thread | coreN | 数字掩码）。"""
+    raw = (os.getenv('RUNTIME_NPU_CORE_MASK') or os.getenv('NPU_CORE_MASK') or 'auto').strip()
+    return raw or 'auto'
+
+
+def rknn_export_requested() -> bool:
+    """是否允许把 .rknn 产物作为 RUNTIME 首选模型。
+
+    只有控制面与 RUNTIME 同机（edge 部署）或显式指定 RUNTIME_INFER_BACKEND=rknn 时才成立；
+    x86/GPU 控制面即便库里存了 .rknn 也不该选它——RUNTIME 侧没有 librknnrt 会直接起不来。
+    """
+    override = (os.getenv('RUNTIME_INFER_BACKEND') or '').strip().lower()
+    if override in ('onnx', 'ort', 'cpu', 'gpu', 'cuda'):
+        return False
+    if override in ('rknn', 'npu', 'rockchip', 'rknpu'):
+        return True
+    return rknn_host_available()
+
+
 def _python_for_export() -> str:
     """Prefer a Python that has ultralytics (VIDEO/base conda), not bare system python."""
     for key in ('RUNTIME_PYTHON', 'EASYAIOT_PYTHON', 'VIDEO_PYTHON'):
@@ -634,6 +715,83 @@ def _resolve_dir_to_onnx(model_dir: Path, default_names: Path) -> Optional[Tuple
     return None
 
 
+def _split_storage_path(stored: str) -> Tuple[Optional[str], Optional[str]]:
+    """把 AiModel.*_model_path（下载 URL 或 bucket/key）解析成 (bucket, object_key)。"""
+    raw = (stored or '').strip()
+    if not raw:
+        return None, None
+    if raw.startswith('/api/v1/buckets/'):
+        parts = urlparse(raw).path.split('/')
+        bucket_name = parts[4] if len(parts) >= 5 and parts[3] == 'buckets' else None
+        object_key = parse_qs(urlparse(raw).query).get('prefix', [None])[0]
+        if bucket_name and object_key:
+            return bucket_name, object_key
+        return None, None
+    if '/' in raw and not os.path.isabs(raw) and not raw.startswith('http'):
+        parts = raw.split('/', 1)
+        return parts[0], parts[1]
+    return None, None
+
+
+def _materialize_export_artifact(model_id: int, model_dir: Path, column: str) -> Optional[Path]:
+    """把 AiModel.<column> 指向的导出产物（含 .names / .rknn.json 伴生文件）落到 model_dir。
+
+    产物 key 形如 exports/model_{id}/rknn/model.rknn；伴生文件与主产物同目录同前缀。
+    MinIO 与 flat 本地存储两种形态都由 ModelService.download_from_minio 内部分流。
+    """
+    try:
+        from models import AiModel
+        from app.services.minio_service import ModelService
+    except Exception:
+        return None
+    try:
+        row = AiModel.query.get(model_id)
+    except Exception as exc:
+        logger.debug('materialize export: AiModel.query.get(%s) failed: %s', model_id, exc)
+        return None
+    bucket, object_key = _split_storage_path(str(getattr(row, column, '') or '')) if row else (None, None)
+    if not bucket or not object_key:
+        return None
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    primary = model_dir / Path(object_key).name
+    ok, err = ModelService.download_from_minio(bucket, object_key, str(primary))
+    if not ok or not primary.is_file() or primary.stat().st_size <= 0:
+        logger.warning('导出产物落地失败 %s/%s: %s', bucket, object_key, err)
+        return None
+
+    prefix = object_key[: object_key.rfind('/') + 1]
+    stem = os.path.splitext(object_key[len(prefix):])[0]
+    for suffix in ('.names', '.rknn.json'):
+        dest = model_dir / (stem + suffix)
+        if dest.is_file():
+            continue
+        ModelService.download_from_minio(bucket, f'{prefix}{stem}{suffix}', str(dest))
+    logger.info(
+        '已从导出记录落地模型产物: model_id=%s %s/%s -> %s', model_id, bucket, object_key, primary,
+    )
+    return primary
+
+
+def _resolve_dir_to_rknn(model_id: int, model_dir: Path, default_names: Path) -> Optional[Tuple[str, str]]:
+    """RK3588 NPU 优先路径：目录里已有 .rknn 就用它，否则从 AiModel.rknn_model_path 拉取。
+
+    与 `_resolve_dir_to_onnx` 不同，这里不会凭空返回规范路径——没有真实 .rknn 时
+    返回 None，让调用方回落到 ONNX 通路（RUNTIME auto 仍可在设备上自行判断）。
+    """
+    if model_dir.is_dir():
+        matches = sorted(model_dir.glob('*.rknn'))
+        if matches:
+            preferred = [p for p in matches if p.name.lower() == 'model.rknn']
+            chosen = (preferred or matches)[0]
+            return str(chosen), _pick_names(chosen, default_names)
+
+    materialized = _materialize_export_artifact(model_id, model_dir, 'rknn_model_path')
+    if materialized is not None:
+        return str(materialized), _pick_names(materialized, default_names)
+    return None
+
+
 def _materialize_db_model(model_id: int, model_dir: Path) -> Optional[Path]:
     """当 data/models/{id}/ 下没有可用的 onnx/pt 时，尝试从 AiModel.model_path
     （MinIO-style URL）懒加载权重到 model_dir/model.{ext}。
@@ -768,6 +926,12 @@ def _resolve_model_paths(task: AlgorithmTask, prefer_cluster: bool = False) -> T
 
         model_dir = _resolve_custom_model_dir(mid_int, prefer_cluster=prefer_cluster)
         if model_dir is not None:
+            # RK3588/NPU 节点：优先使用控制面导出的 .rknn（含 .rknn.json 描述轴序）。
+            # 没有真实 .rknn 时静默回落 ONNX 通路，由 RUNTIME 侧 auto 再判断。
+            if rknn_export_requested():
+                rknn = _resolve_dir_to_rknn(mid_int, model_dir, default_names)
+                if rknn:
+                    return rknn
             resolved = _resolve_dir_to_onnx(model_dir, default_names)
             if resolved:
                 # _resolve_dir_to_onnx 在目录缺失时会返回规范路径 model.onnx，
@@ -987,6 +1151,8 @@ def _build_runtime_ini_text(
     alert_hook_url: str,
     compute_node_id: str,
     resolved_urls: Dict[str, str],
+    infer_backend: str = 'auto',
+    npu_core_mask: str = 'auto',
 ) -> str:
     devices_json_one_line = _devices_json(devices_for_json, resolved_urls).replace('\n', '')
     regions_block = _regions_ini_block(devices_for_json, task.id)
@@ -1006,6 +1172,8 @@ fps=25
 enable=true
 model_path={model_path}
 classes_path={classes_path}
+infer_backend={infer_backend}
+npu_core_mask={npu_core_mask}
 threads=2
 frame_skip={frame_skip}
 prefer_gpu={'true' if prefer_gpu else 'false'}
@@ -1116,15 +1284,23 @@ def generate_runtime_inis(
         raise ValueError(f'任务 {task.id} 的设备均无可用 RTSP/source 地址')
 
     model_path, classes_path = _resolve_model_paths(task, prefer_cluster=prefer_cluster_model)
+    model_ext = str(model_path).lower()
+    is_rknn = model_ext.endswith('.rknn')
     if write_local and not os.path.isfile(model_path):
-        raise ValueError(f'模型文件不存在: {model_path}（cpp 需要 .onnx；.pt 应已自动导出）')
-    if write_local and not str(model_path).lower().endswith('.onnx'):
-        raise ValueError(f'RUNTIME 最终需要 .onnx，当前为: {model_path}')
-    if prefer_cluster_model and not str(model_path).lower().endswith('.onnx'):
         raise ValueError(
-            f'远程 cpp 需要 ONNX 模型，当前解析到: {model_path}。'
+            f'模型文件不存在: {model_path}（cpp 需要 .onnx/.rknn；.pt 应已自动导出）'
+        )
+    if write_local and not (model_ext.endswith('.onnx') or is_rknn):
+        raise ValueError(f'RUNTIME 最终需要 .onnx/.rknn，当前为: {model_path}')
+    if prefer_cluster_model and not (model_ext.endswith('.onnx') or is_rknn):
+        raise ValueError(
+            f'远程 cpp 需要 ONNX/RKNN 模型，当前解析到: {model_path}。'
             f'请确保模型已同步至集群，或允许控制面执行 .pt→onnx 导出'
         )
+    # .rknn 产物必须显式声明 rknn：createInferEngine 只在 auto 时探测设备可用性，
+    # 但写入 rknn 能让日志/排障一眼看出走了 NPU 通路。
+    infer_backend = resolve_infer_backend(model_path)
+    npu_core_mask = resolve_npu_core_mask()
 
     conf = float(task.detect_conf if task.detect_conf is not None else 0.5)
     cooldown = int(task.alert_event_suppress_time or 30)
@@ -1297,6 +1473,8 @@ def generate_runtime_inis(
             alert_hook_url=alert_hook_url,
             compute_node_id=compute_node_id,
             resolved_urls=resolved_urls,
+            infer_backend=infer_backend,
+            npu_core_mask=npu_core_mask,
         )
         contents.append(content)
         if write_local:
@@ -1506,9 +1684,12 @@ def generate_stream_forward_runtime_ini_content(
 
 
 REMOTE_RUNTIME_BIN = '/opt/easyaiot/RUNTIME/bin/RUNTIME'
+# librknnrt.so 在 Rockchip 官方固件里可能落在 /oem/usr/lib 或 /vendor/usr/lib，
+# RUNTIME 通过 dlopen 查找，因此这些目录必须进 LD_LIBRARY_PATH。
 REMOTE_RUNTIME_LD_LIBRARY_PATH = (
     '/opt/easyaiot/RUNTIME/lib:/usr/local/cuda/lib64:/usr/local/cuda/lib'
     ':/usr/lib/x86_64-linux-gnu:/usr/lib/aarch64-linux-gnu'
+    ':/usr/local/lib:/oem/usr/lib:/vendor/usr/lib'
 )
 
 
@@ -1614,6 +1795,10 @@ def runtime_library_path_env() -> str:
     ):
         if os.path.isdir(cuda_path):
             parts.append(cuda_path)
+    # librknnrt.so 所在目录（RK3588 固件常见落点），有文件才加，避免污染 x86 环境
+    for lib_dir in (str((_repo_root() / 'RUNTIME' / 'lib')), '/usr/local/lib', '/oem/usr/lib', '/vendor/usr/lib'):
+        if os.path.isfile(os.path.join(lib_dir, 'librknnrt.so')):
+            parts.append(lib_dir)
     # dedupe preserve order
     seen = set()
     out = []

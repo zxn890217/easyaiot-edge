@@ -36,6 +36,12 @@ cmake-build-orangepi/*
 /.nb-gradle/
 /build/
 
+# RKNN / rknpu2 SDK drop-in (docker builds see it through the /src mount)
+/.rknn-sdk/
+/.bundle-runtime/
+/deploy.env
+/VERSION
+
 
 
 ### admin-web ###

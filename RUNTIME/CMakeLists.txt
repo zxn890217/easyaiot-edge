@@ -16,6 +16,32 @@ set(CMAKE_CXX_FLAGS_RELEASE "$ENV{CXXFLAGS} -O3 -Wall")
 # Optional: path to official ONNX Runtime C++ SDK (include/ + lib/)
 set(ONNXRUNTIME_ROOT "" CACHE PATH "ONNX Runtime C++ SDK root")
 
+# Optional: Rockchip NPU (RKNN) inference backend for RK3588 / RK356x / RV11xx.
+# Needs the rknpu2 runtime SDK: rknn_api.h + librknnrt.so.
+option(RUNTIME_WITH_RKNN "Build the Rockchip RKNN NPU inference backend" OFF)
+set(RKNN_SDK_ROOT "" CACHE PATH "rknpu2 SDK root (include/ + lib/)")
+find_path(RKNN_INCLUDE_DIR NAMES rknn_api.h
+    HINTS ${RKNN_SDK_ROOT}/include ${RKNN_SDK_ROOT}/rknpu2/include
+          ${RKNN_SDK_ROOT}/librknn_api/include
+    PATHS /usr/include /usr/local/include /usr/include/rknn /usr/local/include/rknn)
+# Official rknpu2 releases keep the aarch64 .so under librknn_api/aarch64 (no lib/),
+# so accept both layouts; on a running board the driver's /usr/lib copy wins anyway.
+find_library(RKNN_RUNTIME_LIBRARY NAMES rknnrt
+    HINTS ${RKNN_SDK_ROOT}/lib ${RKNN_SDK_ROOT}/rknpu2/lib
+          ${RKNN_SDK_ROOT}/librknn_api/aarch64 ${RKNN_SDK_ROOT}/aarch64
+    PATHS /usr/lib /usr/local/lib /usr/lib/aarch64-linux-gnu /usr/local/lib/aarch64-linux-gnu
+          /oem/usr/lib /vendor/usr/lib)
+if(RUNTIME_WITH_RKNN)
+    if(NOT RKNN_INCLUDE_DIR OR NOT RKNN_RUNTIME_LIBRARY)
+        message(FATAL_ERROR
+            "RUNTIME_WITH_RKNN=ON but rknn_api.h / librknnrt.so were not found. "
+            "Pass -DRKNN_SDK_ROOT=<rknpu2 dir> or -DRKNN_INCLUDE_DIR=... -DRKNN_RUNTIME_LIBRARY=...")
+    endif()
+    message(STATUS "RKNN: include=${RKNN_INCLUDE_DIR} lib=${RKNN_RUNTIME_LIBRARY}")
+else()
+    message(STATUS "RKNN: backend disabled (RUNTIME_WITH_RKNN=OFF)")
+endif()
+
 find_package(OpenCV REQUIRED)
 message(STATUS "OpenCV: ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "OpenCV version: ${OpenCV_VERSION}")
@@ -73,6 +99,9 @@ endif()
 
 file(GLOB_RECURSE Src_SOURCES ${CMAKE_SOURCE_DIR}/src/*.cpp)
 list(FILTER Src_SOURCES EXCLUDE REGEX ".*YoloEngine_Fixed\\.cpp$")
+if(NOT RUNTIME_WITH_RKNN)
+    list(FILTER Src_SOURCES EXCLUDE REGEX ".*RknnEngine\\.cpp$")
+endif()
 
 add_executable(${PROJECT_NAME} ${Src_SOURCES})
 
@@ -113,6 +142,12 @@ target_link_libraries(${PROJECT_NAME}
 
 # glog >= 0.7 needs GLOG_USE_GLOG_EXPORT so GLOG_EXPORT is defined; glog 0.6 ignores it.
 target_compile_definitions(${PROJECT_NAME} PRIVATE GLOG_USE_GLOG_EXPORT)
+
+if(RUNTIME_WITH_RKNN)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${RKNN_INCLUDE_DIR})
+    target_link_libraries(${PROJECT_NAME} ${RKNN_RUNTIME_LIBRARY})
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RUNTIME_WITH_RKNN=1)
+endif()
 
 # Version string injected by install/build scripts (e.g. 0.1.0+gabcdef)
 if(NOT DEFINED RUNTIME_VERSION_STR OR RUNTIME_VERSION_STR STREQUAL "")

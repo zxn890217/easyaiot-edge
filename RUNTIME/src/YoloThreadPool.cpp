@@ -20,10 +20,22 @@ int YoloThreadPool::setUp(std::string model_path,
                           bool prefer_gpu,
                           bool force_cpu,
                           int gpu_device_id,
-                          float score_threshold) {
+                          float score_threshold,
+                          std::string infer_backend,
+                          int npu_core_mask) {
+    if (num_threads < 1) {
+        num_threads = 1;
+    }
     for (int i = 0; i < num_threads; ++i) {
-        auto engine = std::make_shared<YoloEngine>();
-        int ret = engine->LoadModel(model_path, model_class, prefer_gpu, force_cpu, gpu_device_id);
+        EngineLoadOptions options;
+        options.preferGpu = prefer_gpu;
+        options.forceCpu = force_cpu;
+        options.gpuDeviceId = gpu_device_id;
+        options.npuCoreMask = npu_core_mask;
+        options.instanceIndex = i;
+
+        auto engine = createInferEngine(infer_backend, model_path, options);
+        int ret = engine->LoadModel(model_path, model_class, options);
         if (ret != 0) {
             return ret;
         }
@@ -53,7 +65,7 @@ std::string YoloThreadPool::modelLayout() const {
 void YoloThreadPool::worker(int id) {
     while (!stop) {
         std::tuple<int, int, cv::Mat> task;
-        std::shared_ptr<YoloEngine> instance = engines_[static_cast<size_t>(id)];
+        std::shared_ptr<InferEngine> instance = engines_[static_cast<size_t>(id)];
         {
             std::unique_lock<std::mutex> lock(mtx1);
             cv_task.wait(lock, [&] { return !tasks.empty() || stop; });

@@ -1,4 +1,4 @@
-﻿//
+//
 // Created by basiclab on 25-10-15.
 //
 #include "AlgoMqttBus.h"
@@ -505,6 +505,10 @@ void Detech::_controlServerThreadFunc() {
             response["gpu_device_id"] = this->_config.gpuDeviceId;
             response["prefer_hwaccel"] = this->_config.preferHwaccel;
             response["force_soft_av"] = this->_config.forceSoftAv;
+            response["infer_backend"] = this->_config.inferBackend.empty()
+                ? "auto"
+                : this->_config.inferBackend;
+            response["npu_core_mask"] = this->_config.npuCoreMask;
             
             Json::StreamWriterBuilder writer;
             res.set_content(Json::writeString(writer, response), "application/json");
@@ -662,13 +666,15 @@ bool Detech::_init_yolo_detector() {
         }
         
         LOG(INFO) << "[INIT] Loading YOLO model with " << _config.threadNums << " threads"
+                  << " infer_backend=" << (_config.inferBackend.empty() ? "auto" : _config.inferBackend)
+                  << " npu_core_mask=" << _config.npuCoreMask
                   << " prefer_gpu=" << (_config.preferGpu ? "true" : "false")
                   << " force_cpu=" << (_config.forceCpu ? "true" : "false")
                   << " gpu_device_id=" << _config.gpuDeviceId;
         int ret = yolo_thread_pool->setUp(
             modelPath, classes, _config.threadNums,
             _config.preferGpu, _config.forceCpu, _config.gpuDeviceId,
-            _config.alarmConfidenceThreshold);
+            _config.alarmConfidenceThreshold, _config.inferBackend, _config.npuCoreMask);
         if (ret) {
             LOG(ERROR) << "[ERROR] YOLO thread pool initialization failed, error code: " << ret;
             return false;

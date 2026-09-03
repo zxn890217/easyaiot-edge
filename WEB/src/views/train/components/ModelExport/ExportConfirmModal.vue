@@ -30,6 +30,9 @@
             allow-clear
             @change="handleFormatChange"
           />
+          <div v-if="formState.format === 'rknn'" class="format-tip">
+            导出 RKNN 权重用于 RK3588 NPU 推理，默认 FP16、输入尺寸 640，转换耗时约数十秒。
+          </div>
         </a-form-item>
       </a-form>
     </div>
@@ -54,14 +57,16 @@ const props = defineProps({
 
 const emit = defineEmits(['confirm']);
 
+// 后端 SUPPORTED_FORMATS = ('rknn', 'onnx')，openvino 暂未实现转换，置灰避免必然失败的任务
 const formatOptions = [
+  { label: 'RKNN (RK3588 NPU)', value: 'rknn' },
   { label: 'ONNX', value: 'onnx' },
-  { label: 'OpenVINO', value: 'openvino' },
+  { label: 'OpenVINO（暂不支持）', value: 'openvino', disabled: true },
 ];
 
 const formState = reactive({
   modelId: null as number | null,
-  format: null as 'onnx' | 'openvino' | null,
+  format: null as string | null,
 });
 
 const state = reactive({
@@ -134,6 +139,13 @@ function handleConfirm() {
   :deep(.ant-descriptions-item-label) {
     font-weight: 500;
     width: 120px;
+  }
+
+  .format-tip {
+    margin-top: 4px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #8c8c8c;
   }
 }
 </style>

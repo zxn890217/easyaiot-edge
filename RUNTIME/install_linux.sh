@@ -15,6 +15,9 @@
 #       默认 docker：在 VIDEO 同源容器内用系统 g++ 编译（推荐，免 sysroot 降级）
 #       host：本机 conda 编译（新 glibc 主机上产物可能无法进 VIDEO 容器）
 #   EASYAIOT_RUNTIME_BUILD_IMAGE         # 覆盖构建镜像（默认优先 video-service:latest）
+#   RUNTIME_WITH_RKNN=auto|on|off        # Rockchip NPU 后端；auto=本机有 rknn_api.h 就开
+#   RKNN_SDK_ROOT                        # rknpu2 SDK 目录（含 include/rknn_api.h）
+#       docker 编译模式下 SDK 必须能被容器看到：放 RUNTIME/.rknn-sdk 最省事（随 /src 挂载）
 #   EASYAIOT_RUNTIME_DEPLOY_MODE=integrated
 #       云边一体：需 VIDEO/Gateway/MQTT/SRS 地址，本机只装 RUNTIME
 #       纯边缘形态请用平台安装：bash .scripts/docker/install_linux.sh install（选 edge → standalone）
@@ -40,6 +43,8 @@ source "$ROOT/scripts/version_meta.sh"
 source "$ROOT/scripts/os_family.sh"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/runtime_os_matrix.sh"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/rknn_sdk.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -714,6 +719,33 @@ prepare_runtime_build_env() {
   return 0
 }
 
+# Rockchip NPU：把 RUNTIME_WITH_RKNN / RKNN_SDK_ROOT 翻译成 cmake 参数（host 编译用）。
+#   off              -DRUNTIME_WITH_RKNN=OFF（显式写死，避免复用旧 build 目录里的缓存值）
+#   on/auto 且探到 SDK -DRUNTIME_WITH_RKNN=ON -DRKNN_SDK_ROOT=<dir>
+#   auto 且无 SDK     不下开关，编纯 ONNX Runtime 版本
+# 结果放在全局数组 RKNN_CMAKE_ARGS。
+resolve_rknn_cmake_args() {
+  RKNN_CMAKE_ARGS=()
+  local want sdk
+  want="$(printf '%s' "${RUNTIME_WITH_RKNN:-auto}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$want" =~ ^(off|0|false|no)$ ]]; then
+    RKNN_CMAKE_ARGS+=(-DRUNTIME_WITH_RKNN=OFF)
+    return 0
+  fi
+  sdk="$(rknn_sdk_probe || true)"
+  if [[ -n "$sdk" ]]; then
+    RKNN_CMAKE_ARGS+=(-DRKNN_SDK_ROOT="$sdk")
+  fi
+  if [[ "$want" =~ ^(on|1|true|yes)$ ]]; then
+    RKNN_CMAKE_ARGS+=(-DRUNTIME_WITH_RKNN=ON)
+    print_info "强制启用 RKNN NPU 后端（SDK: ${sdk:-系统头文件}）"
+  elif rknn_header_found; then
+    print_info "检测到 RKNN SDK (${sdk:-系统头文件})，启用 NPU 推理后端"
+    RKNN_CMAKE_ARGS+=(-DRUNTIME_WITH_RKNN=ON)
+  fi
+  return 0
+}
+
 build_runtime_in_docker() {
   if ! docker_available; then
     print_error "docker 不可用，无法使用同源容器编译。可设 EASYAIOT_RUNTIME_BUILD_MODE=host 回退本机编译"
@@ -771,6 +803,28 @@ build_runtime_in_docker() {
 
   runtime_resolve_version_meta "$ROOT" "$REPO"
   docker_opts+=(-e "RUNTIME_VERSION_STR=${RUNTIME_VERSION}")
+
+  # Rockchip NPU：容器里也得有 rknn_api.h / librknnrt.so，否则 auto 模式会静默编出
+  # 没有 NPU 后端的二进制（盒子上跑 ONNX Runtime CPU，NPU 白装）。
+  # SDK 在仓库内时它本就随 /src 一起挂载，只换算容器内路径；在仓库外则按原路径只读挂入。
+  local rknn_sdk
+  rknn_sdk="$(rknn_sdk_probe || true)"
+  if [[ -n "$rknn_sdk" ]]; then
+    case "$rknn_sdk" in
+      "$REPO"/*)
+        docker_opts+=(-e "RKNN_SDK_ROOT=/src/${rknn_sdk#"$REPO"/}")
+        ;;
+      *)
+        docker_opts+=(-v "$rknn_sdk:$rknn_sdk:ro" -e "RKNN_SDK_ROOT=$rknn_sdk")
+        ;;
+    esac
+    print_info "RKNN SDK 已提供给构建容器: $rknn_sdk"
+  elif [[ "$(printf '%s' "${RUNTIME_WITH_RKNN:-auto}" | tr '[:upper:]' '[:lower:]')" =~ ^(on|1|true|yes)$ ]]; then
+    print_warning "RUNTIME_WITH_RKNN=on，但未找到 RKNN SDK；容器内 cmake 将因缺 rknn_api.h 失败"
+    print_warning "  获取：rkpack/rknpu2 的 runtime/RK3588/Linux/librknn_api，或 RK_SDK 内 rknpu2 目录"
+    print_warning "  放到仓库内 RUNTIME/.rknn-sdk 即可自动识别（docker 编译无需额外挂载）"
+  fi
+  docker_opts+=(-e "RUNTIME_WITH_RKNN=${RUNTIME_WITH_RKNN:-auto}")
 
   print_info "在容器内编译 RUNTIME（version=${RUNTIME_VERSION}）..."
   if ! docker run "${docker_opts[@]}" "$image" bash /src/RUNTIME/scripts/build_inside_container.sh; then
@@ -852,6 +906,11 @@ build_runtime_on_host() {
     cmake_extra+=(-DCMAKE_EXE_LINKER_FLAGS="$el7_link_flags")
     cmake_extra+=(-DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX")
   fi
+  # Rockchip NPU：只要本机有 rknn_api.h（rknpu2 SDK / 固件开发包）就顺带编出 RKNN 后端。
+  # RUNTIME_WITH_RKNN=off 关闭；=on 强制开启（缺 SDK 时由 cmake 报错）；
+  # RKNN_SDK_ROOT 指向解压后的 SDK 时优先使用。
+  resolve_rknn_cmake_args
+  cmake_extra+=("${RKNN_CMAKE_ARGS[@]}")
   if ! "$cmake_bin" "$ROOT" \
     -B "$build_dir" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -1383,7 +1442,7 @@ main() {
       exit 1
       ;;
     help|-h|--help)
-      sed -n '2,35p' "$0"
+      sed -n '2,29p' "$0"
       echo ""
       echo "命令:"
       echo "  (无参数)               - 交互式菜单（TTY）"

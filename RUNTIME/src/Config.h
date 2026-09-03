@@ -84,6 +84,14 @@ typedef struct Config {
     bool forceCpu{false};
     int gpuDeviceId{0};
 
+    /** [ai] infer_backend: auto | onnx | rknn (Rockchip NPU, e.g. RK3588) */
+    std::string inferBackend{"auto"};
+    /**
+     * [ai] npu_core_mask: 0/auto = driver decides, 7/all = 3 cores,
+     * per_thread = pin engine i to core i%3, otherwise a bit mask (1/2/4/3/5/6).
+     */
+    int npuCoreMask{0};
+
     // FFmpeg NVDEC/NVENC (NVIDIA); soft fallback on failure
     bool preferHwaccel{true};
     bool forceSoftAv{false};

@@ -29,36 +29,21 @@ export function getBasicColumns(): BasicColumn[] {
       dataIndex: 'format',
       width: 120,
       align: 'center',
-      customRender: ({text}) => {
-        const formatMap: Record<string, string> = {
-          'onnx': 'ONNX',
-          'openvino': 'OpenVINO',
-        };
-        return formatMap[text] || text?.toUpperCase() || '--';
-      },
+      // 渲染交给 index.vue 的 #bodyCell（Tag 需要用到 formatLabels/formatColors）
     },
     {
       title: '状态',
       dataIndex: 'status',
       width: 120,
       align: 'center',
-      customRender: ({text}) => {
-        const statusMap: Record<string, {text: string; color: string}> = {
-          'PENDING': {text: '等待中', color: 'default'},
-          'PROCESSING': {text: '处理中', color: 'processing'},
-          'COMPLETED': {text: '已完成', color: 'success'},
-          'FAILED': {text: '失败', color: 'error'},
-        };
-        const status = statusMap[text] || {text: text || '--', color: 'default'};
-        return status.text;
-      },
+      // 渲染交给 index.vue 的 #bodyCell（Badge 需要用到 statusLabels）
     },
     {
       title: '创建时间',
       dataIndex: 'created_at',
       width: 180,
       align: 'center',
-      customRender: ({text}) => formatDateTime(text),
+      // 渲染交给 index.vue 的 #bodyCell
     },
     {
       width: 150,
@@ -101,20 +86,5 @@ export function getFormConfig(): Partial<FormProps> {
       },
     ],
   };
-}
-
-function formatDateTime(dateString: string): string {
-  if (!dateString) return '--';
-  try {
-    // 解析ISO格式时间字符串（可能包含时区信息）
-    const date = new Date(dateString);
-    // 检查日期是否有效
-    if (isNaN(date.getTime())) {
-      return dateString;
-    }
-    return date.toLocaleDateString('zh-CN') + ' ' + date.toLocaleTimeString('zh-CN', {hour12: false});
-  } catch (e) {
-    return dateString;
-  }
 }
 

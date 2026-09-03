@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Configuration File Parser Implementation
  */
 
@@ -10,6 +10,47 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cctype>
+
+namespace {
+
+std::string lowerTrim(const std::string& s) {
+    const std::string ws = " \t\r\n";
+    const size_t a = s.find_first_not_of(ws);
+    if (a == std::string::npos) return "";
+    const size_t b = s.find_last_not_of(ws);
+    std::string v = s.substr(a, b - a + 1);
+    std::transform(v.begin(), v.end(), v.begin(), ::tolower);
+    return v;
+}
+
+/**
+ * [ai] npu_core_mask — RK3588 has 3 NPU cores (bit0/bit1/bit2 of rknn_core_mask).
+ *   auto|0        let the driver schedule          (RKNN_NPU_CORE_AUTO)
+ *   all|7         pin to all three cores           (RKNN_NPU_CORE_0_1_2)
+ *   per_thread|-1 one core per inference thread    (engine i → core i % 3)
+ *   core0/core1/core2, core0_1, numeric masks       explicit binding
+ */
+int parseNpuCoreMask(const std::string& value) {
+    const std::string v = lowerTrim(value);
+    if (v.empty() || v == "auto" || v == "default" || v == "driver") return 0;
+    if (v == "all" || v == "every" || v == "0_1_2" || v == "core0_1_2") return 7;
+    if (v == "per_thread" || v == "per-thread" || v == "round_robin" || v == "round-robin") return -1;
+    if (v == "core0" || v == "npu0") return 1;
+    if (v == "core1" || v == "npu1") return 2;
+    if (v == "core2" || v == "npu2") return 4;
+    if (v == "core0_1" || v == "0_1") return 3;
+    if (v == "core0_2" || v == "0_2") return 5;
+    if (v == "core1_2" || v == "1_2") return 6;
+    try {
+        const long n = std::stol(v, nullptr, 0);  // accepts 0x… too
+        if (n < -1 || n > 7) return 0;
+        return static_cast<int>(n);
+    } catch (...) {
+        return 0;
+    }
+}
+
+}  // namespace
 
 std::string ConfigParser::trim(const std::string& str) {
     const std::string whitespace = " \t\r\n";
@@ -200,6 +241,10 @@ bool ConfigParser::parse(const std::string& filename, Config& config) {
             } else if (key == "gpu_device_id") {
                 config.gpuDeviceId = parseInt(value);
                 if (config.gpuDeviceId < 0) config.gpuDeviceId = 0;
+            } else if (key == "infer_backend") {
+                config.inferBackend = trim(value);
+            } else if (key == "npu_core_mask") {
+                config.npuCoreMask = parseNpuCoreMask(value);
             } else if (key == "prefer_hwaccel") {
                 config.preferHwaccel = parseBool(value);
             } else if (key == "force_soft_av") {
@@ -468,6 +513,17 @@ bool ConfigParser::parse(const std::string& filename, Config& config) {
         int id = parseInt(v);
         if (id >= 0) config.gpuDeviceId = id;
     }
+    // Rockchip NPU: RUNTIME_INFER_BACKEND wins over the ini so VIDEO can flip a task
+    // to rknn without rewriting [ai]; RUNTIME_FORCE_CPU never disables the NPU.
+    if (const char* v = std::getenv("RUNTIME_INFER_BACKEND")) {
+        std::string s = lowerTrim(v);
+        if (!s.empty()) config.inferBackend = s;
+    }
+    if (const char* v = std::getenv("NPU_CORE_MASK")) {
+        config.npuCoreMask = parseNpuCoreMask(v);
+    } else if (const char* v = std::getenv("RUNTIME_NPU_CORE_MASK")) {
+        config.npuCoreMask = parseNpuCoreMask(v);
+    }
     if (config.forceCpu) {
         config.preferGpu = false;
     }
@@ -516,7 +572,9 @@ bool ConfigParser::parse(const std::string& filename, Config& config) {
         config.preferHwaccel = false;
     }
 
-    LOG(INFO) << "[CONFIG] AI prefer_gpu=" << (config.preferGpu ? "true" : "false")
+    LOG(INFO) << "[CONFIG] AI infer_backend=" << (config.inferBackend.empty() ? "auto" : config.inferBackend)
+              << " npu_core_mask=" << config.npuCoreMask
+              << " prefer_gpu=" << (config.preferGpu ? "true" : "false")
               << " force_cpu=" << (config.forceCpu ? "true" : "false")
               << " gpu_device_id=" << config.gpuDeviceId
               << " prefer_hwaccel=" << (config.preferHwaccel ? "true" : "false")

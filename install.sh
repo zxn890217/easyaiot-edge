@@ -17,6 +17,9 @@
 #   EASYAIOT_EDGE_APP_TITLE     系统名（默认 EasyAIoT Edge 边缘智能平台，共用镜像免重建生效）
 #   EASYAIOT_EDGE_DASHBOARD_TITLE 监控大屏标题（默认 EasyAIoT Edge 算法预警监控平台）
 #   EASYAIOT_RUNTIME_SKIP=1 跳过 RUNTIME（C++）编译
+#   RUNTIME_WITH_RKNN / RKNN_SDK_ROOT
+#                           RK3588 等 Rockchip NPU 盒子：透传给 RUNTIME 编译开启 NPU 后端
+#                           （RK3588 建议直接用 ./install_rk3588.sh，含体检与 NPU 端到端校验）
 # ============================================
 set -eo pipefail
 
@@ -26,6 +29,18 @@ export EASYAIOT_ROOT="$SCRIPT_DIR"
 export EASYAIOT_DEPLOY_PROFILE=edge
 export EASYAIOT_EDGE_MORPHOLOGY=standalone
 export EASYAIOT_MEDIA_ROOT="${EASYAIOT_MEDIA_ROOT:-/mnt/easyaiot-media}"
+
+# aarch64（RK3588 等边缘盒子）必须走 VIDEO 的 ARM 安装器：Dockerfile.arm + linux/arm64 基础镜像。
+# 沿用 x86 那条会构建出本机跑不动的镜像，且拿不到 arm wheels/ffmpeg 离线缓存。
+VIDEO_INSTALLER="VIDEO/install_linux.sh"
+case "$(uname -m)" in
+    aarch64|arm64)
+        if [ -f "VIDEO/install_linux_arm.sh" ]; then
+            VIDEO_INSTALLER="VIDEO/install_linux_arm.sh"
+        fi
+        ;;
+esac
+export VIDEO_INSTALLER
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -73,7 +88,7 @@ install_middleware() {
 
 install_modules() {
     info "安装 VIDEO（含 RUNTIME 编译与 .env.docker 固化 edge 开关）..."
-    bash VIDEO/install_linux.sh install
+    bash "$VIDEO_INSTALLER" install
 
     info "安装 WEB（edge 构建参数：profile=mini + EDGE_STANDALONE=true，nginx.edge.conf）..."
     WEB_PORT="${WEB_PORT:-8888}" bash WEB/install_linux.sh install
@@ -105,14 +120,14 @@ verify_all() {
 module_ctl() {
     local cmd="$1"
     (cd deploy && $COMPOSE_CMD "$cmd")
-    bash VIDEO/install_linux.sh "$cmd" || true
+    bash "$VIDEO_INSTALLER" "$cmd" || true
     bash WEB/install_linux.sh "$cmd" || true
 }
 
 clean_all() {
     check_docker
     info "清理 VIDEO / WEB 模块（容器、网络、镜像）..."
-    bash VIDEO/install_linux.sh clean || true
+    bash "$VIDEO_INSTALLER" clean || true
     bash WEB/install_linux.sh clean || true
 
     info "下线中间件（PostgreSQL / Redis / SRS）..."
@@ -160,7 +175,7 @@ main() {
         verify) verify_all ;;
         clean) clean_all ;;
         stop|start|restart|status) module_ctl "$1" ;;
-        logs) (cd deploy && $COMPOSE_CMD logs); bash VIDEO/install_linux.sh logs || true; ;;
+        logs) (cd deploy && $COMPOSE_CMD logs); bash "$VIDEO_INSTALLER" logs || true; ;;
         help|--help|-h|*)
             sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             ;;

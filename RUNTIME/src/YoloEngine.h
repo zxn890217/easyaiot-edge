@@ -1,7 +1,8 @@
 #ifndef YOLO_ENGINE_H
 #define YOLO_ENGINE_H
 
-#include "Datatype.h"
+#include "InferEngine.h"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -9,45 +10,42 @@
 #include <onnxruntime_cxx_api.h>
 
 /**
- * Ultralytics YOLO detect engine (ONNX Runtime).
+ * Ultralytics YOLO detect engine (ONNX Runtime CPU / CUDA EP).
  * Supports:
  *  - YOLOv8 / YOLO11 classic detect export: [1, 4+C, N] → NMS
  *  - YOLO26 end2end export: [1, N, 6] = [x1,y1,x2,y2,conf,cls] (no NMS)
  *  - .pt paths: auto-export to sibling .onnx via RUNTIME/scripts/ensure_onnx_model.py
+ *
+ * Pre/post-processing is shared with the other backends through yolocore (YoloCommon.h)
+ * so switching infer_backend does not change detections.
  */
-class YoloEngine {
+class YoloEngine : public InferEngine {
 public:
     YoloEngine();
-    ~YoloEngine();
+    ~YoloEngine() override;
 
-    int LoadModel(std::string model_path,
-                  std::vector<std::string> model_class,
-                  bool prefer_gpu = true,
-                  bool force_cpu = false,
-                  int gpu_device_id = 0);
+    int LoadModel(const std::string& model_path,
+                  const std::vector<std::string>& model_class,
+                  const EngineLoadOptions& options) override;
 
-    int Run(cv::Mat& image, std::vector<DetectObject>& objects);
+    int Run(cv::Mat& image, std::vector<DetectObject>& objects) override;
 
-    /** "cuda" | "cpu" | "none" */
-    const std::string& inferEp() const { return inferEp_; }
-    /** "detect" | "end2end" | "unknown" */
-    const std::string& modelLayout() const { return modelLayout_; }
-    const std::string& loadedOnnxPath() const { return loadedOnnxPath_; }
-
-    void setScoreThreshold(float threshold);
+    const std::string& inferEp() const override { return inferEp_; }
+    const std::string& modelLayout() const override { return modelLayout_; }
+    const std::string& loadedModelPath() const override { return loadedModelPath_; }
+    void setScoreThreshold(float threshold) override;
 
 private:
     int Inference(const cv::Mat& image, std::vector<DetectObject>& objects);
     int createSession(const std::string& model_path, bool use_cuda, int gpu_device_id);
     static std::string ensureOnnxPath(const std::string& model_path);
     void loadNamesFromOnnxMetadata();
-    void detectLayoutFromOutputShape(const std::vector<int64_t>& dims);
 
     bool ready_{false};
     bool end2end_{false};
     std::string inferEp_{"none"};
     std::string modelLayout_{"unknown"};
-    std::string loadedOnnxPath_;
+    std::string loadedModelPath_;
     float scoreThreshold_{0.25f};
     float nmsThreshold_{0.45f};
 

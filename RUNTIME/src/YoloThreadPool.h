@@ -1,7 +1,7 @@
 #ifndef YOLO_THREAD_POOL_H
 #define YOLO_THREAD_POOL_H
 
-#include "YoloEngine.h"
+#include "InferEngine.h"
 
 #include <condition_variable>
 #include <map>
@@ -15,7 +15,7 @@
 class YoloThreadPool {
 private:
     std::queue<std::tuple<int, int, cv::Mat>> tasks;
-    std::vector<std::shared_ptr<YoloEngine>> engines_;
+    std::vector<std::shared_ptr<InferEngine>> engines_;
     std::map<int, std::map<int, cv::Mat>> img_results;
     std::vector<std::thread> threads;
     std::mutex mtx1;
@@ -35,7 +35,9 @@ public:
               bool prefer_gpu = true,
               bool force_cpu = false,
               int gpu_device_id = 0,
-              float score_threshold = 0.25f);
+              float score_threshold = 0.25f,
+              std::string infer_backend = "auto",
+              int npu_core_mask = 0);
     int submitTask(const cv::Mat& img, int input_id, int frame_id);
     int getTargetResult(std::vector<DetectObject>& objects, int input_id, int frame_id);
     int getTargetImgResult(cv::Mat& img, int input_id, int frame_id);

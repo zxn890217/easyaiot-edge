@@ -88,6 +88,30 @@ echo "[RUNTIME/container] cmake=$CMAKE_BIN ld=$SYSTEM_LD"
 RUNTIME_VERSION_STR="${RUNTIME_VERSION_STR:-unknown}"
 echo "[RUNTIME/container] version=$RUNTIME_VERSION_STR"
 echo "[RUNTIME/container] cmake 配置..."
+# Rockchip NPU：由宿主机通过环境变量决定（RUNTIME_WITH_RKNN），SDK 目录须已挂载进容器
+# （RUNTIME/install_linux.sh 会把 RKNN_SDK_ROOT 传成容器内可见的路径）。
+rknn_args=()
+case "$(printf '%s' "${RUNTIME_WITH_RKNN:-auto}" | tr '[:upper:]' '[:lower:]')" in
+  off|0|false|no)
+    rknn_args+=(-DRUNTIME_WITH_RKNN=OFF)
+    ;;
+  on|1|true|yes)
+    rknn_args+=(-DRUNTIME_WITH_RKNN=ON)
+    ;;
+  *)
+    if [[ -f "${RKNN_SDK_ROOT:-}/include/rknn_api.h" ]] \
+       || [[ -f "${RKNN_SDK_ROOT:-}/librknn_api/include/rknn_api.h" ]] \
+       || [[ -f /usr/include/rknn_api.h ]] || [[ -f /usr/local/include/rknn_api.h ]]; then
+      echo "[RUNTIME/container] 容器内发现 rknn_api.h，启用 RKNN NPU 后端"
+      rknn_args+=(-DRUNTIME_WITH_RKNN=ON)
+    fi
+    ;;
+esac
+if [[ -n "${RKNN_SDK_ROOT:-}" ]]; then
+  rknn_args+=(-DRKNN_SDK_ROOT="$RKNN_SDK_ROOT")
+fi
+echo "[RUNTIME/container] rknn: ${rknn_args[*]:-auto(off)}"
+
 "$CMAKE_BIN" "$RUNTIME_SRC" \
   -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -98,6 +122,7 @@ echo "[RUNTIME/container] cmake 配置..."
   -DOpenCV_DIR="$CONDA_PREFIX/lib/cmake/opencv5" \
   -DONNXRUNTIME_ROOT="$ORT_ROOT" \
   -DRUNTIME_VERSION_STR="${RUNTIME_VERSION_STR}" \
+  ${rknn_args[@]+"${rknn_args[@]}"} \
   -DCMAKE_CXX_FLAGS="-I$CONDA_PREFIX/include/opencv5"
 
 echo "[RUNTIME/container] 编译中 (-j$JOBS)..."

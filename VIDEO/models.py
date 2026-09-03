@@ -2463,8 +2463,76 @@ class AiModel(db.Model):
     torchscript_model_path = db.Column(db.String(500))
     tensorrt_model_path = db.Column(db.String(500))
     openvino_model_path = db.Column(db.String(500))
+    rknn_model_path = db.Column(db.String(500))
     model_origin = db.Column(db.String(32), default='upload', nullable=True)
     origin_ref = db.Column(db.String(128), nullable=True)
+
+
+class ModelExport(db.Model):
+    """模型导出任务（RK3588 .rknn / .onnx 等产物的异步转换记录）。"""
+    __tablename__ = 'model_export'
+
+    id = db.Column(db.Integer, primary_key=True)
+    model_id = db.Column(db.Integer, nullable=False, index=True)
+    model_name = db.Column(db.String(100))
+    model_path = db.Column(db.String(500))
+    export_format = db.Column(db.String(32), nullable=False)
+    export_path = db.Column(db.String(500))
+    status = db.Column(db.String(16), nullable=False, default='PENDING')
+    error_message = db.Column(db.Text)
+    size_bytes = db.Column(db.BigInteger)
+    target_platform = db.Column(db.String(32))
+    quantized = db.Column(db.Boolean, default=False)
+    imgsz = db.Column(db.Integer)
+    dataset = db.Column(db.String(500))
+    created_at = db.Column(db.DateTime, default=lambda: datetime.utcnow())
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.utcnow(), onupdate=lambda: datetime.utcnow())
+
+
+def ensure_model_export_schema(engine):
+    """老库补 model.rknn_model_path 列与 model_export 表（无 Alembic，启动时幂等 DDL）。"""
+    import logging
+    from sqlalchemy import inspect, text
+
+    log = logging.getLogger(__name__)
+    try:
+        inspector = inspect(engine)
+        tables = inspector.get_table_names()
+
+        if 'model' in tables:
+            col_names = {c['name'] for c in inspector.get_columns('model')}
+            if 'rknn_model_path' not in col_names:
+                with engine.begin() as conn:
+                    conn.execute(text('ALTER TABLE model ADD COLUMN rknn_model_path VARCHAR(500)'))
+                log.info('已为 model 表添加 rknn_model_path 列')
+
+        ddl = [
+            """
+            CREATE TABLE IF NOT EXISTS model_export (
+              id SERIAL PRIMARY KEY,
+              model_id INTEGER NOT NULL,
+              model_name VARCHAR(100),
+              model_path VARCHAR(500),
+              export_format VARCHAR(32) NOT NULL,
+              export_path VARCHAR(500),
+              status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+              error_message TEXT,
+              size_bytes BIGINT,
+              target_platform VARCHAR(32),
+              quantized BOOLEAN DEFAULT FALSE,
+              imgsz INTEGER,
+              dataset VARCHAR(500),
+              created_at TIMESTAMP,
+              updated_at TIMESTAMP
+            )
+            """,
+            'CREATE INDEX IF NOT EXISTS idx_model_export_model_id ON model_export (model_id)',
+        ]
+        with engine.begin() as conn:
+            for stmt in ddl:
+                conn.execute(text(stmt))
+    except Exception as e:
+        log.warning('ensure_model_export_schema: %s', e)
 
 
 def ensure_algorithm_task_sam_columns(engine):

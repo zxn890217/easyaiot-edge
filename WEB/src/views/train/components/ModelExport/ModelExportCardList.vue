@@ -26,7 +26,7 @@
                   <!-- 格式图标 -->
                   <div class="export-format-container" :class="`format-${item.format}`">
                     <div class="format-icon">
-                      {{ item.format === 'onnx' ? 'ONNX' : 'OpenVINO' }}
+                      {{ formatLabels[item.format] || (item.format || '--').toUpperCase() }}
                     </div>
                   </div>
 
@@ -91,6 +91,12 @@ import { formatModelVersionDisplay } from '../../utils/modelVersionUtils';
 defineOptions({name: 'ModelExportCardList'})
 
 const ListItem = List.Item;
+
+const formatLabels: Record<string, string> = {
+  rknn: 'RKNN',
+  onnx: 'ONNX',
+  openvino: 'OpenVINO',
+};
 
 const props = defineProps({
   params: propTypes.object.def({}),
@@ -332,6 +338,11 @@ function handleDownload(record: object) {
   &.format-openvino {
     // OpenVINO 专业配色：深灰紫系
     background: linear-gradient(135deg, #3d3d3d 0%, #4a4a4a 50%, #3d3d3d 100%);
+  }
+
+  &.format-rknn {
+    // RKNN（RK3588 NPU）配色：深青绿系
+    background: linear-gradient(135deg, #0f4c46 0%, #16665e 50%, #0f4c46 100%);
   }
 }
 

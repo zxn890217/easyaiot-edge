@@ -11,10 +11,11 @@ import tempfile
 import json
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
-from flask import Blueprint, request, jsonify, send_file
+from flask import Blueprint, request, jsonify, send_file, after_this_request
 from flask import redirect, url_for, flash, render_template
 from sqlalchemy import or_
 from app.services.minio_service import ModelService
+from app.services import model_export_service
 from app.utils.yolo_validator import validate_yolo_model
 from app.utils.image_utils import download_default_model_image
 from app.utils.model_class_utils import (
@@ -74,6 +75,7 @@ def _serialize_model_item(model: Model) -> dict:
         'torchscript_model_path': model.torchscript_model_path,
         'tensorrt_model_path': model.tensorrt_model_path,
         'openvino_model_path': model.openvino_model_path,
+        'rknn_model_path': getattr(model, 'rknn_model_path', None),
         **_serialize_model_class_fields(model),
         **_serialize_model_provenance(model),
     }
@@ -143,6 +145,7 @@ def models():
                     Model.torchscript_model_path.isnot(None),
                     Model.tensorrt_model_path.isnot(None),
                     Model.openvino_model_path.isnot(None),
+                    Model.rknn_model_path.isnot(None),
                 )
             )
 
@@ -766,8 +769,18 @@ def ota_check():
 
 
 def select_model_format(model, device_type):
-    if device_type == 'gpu' and model.tensorrt_model_path:
+    """按设备类型选择最合适的模型产物。
+
+    device_type 由边缘端上报：gpu 优先 TensorRT，rknn/npu/rk35xx 优先 .rknn，
+    其余（含 cpu）回落到 .onnx，最后才是原始 .pt 权重。
+    """
+    device = str(device_type or '').strip().lower()
+    if device == 'gpu' and model.tensorrt_model_path:
         return model.tensorrt_model_path
+    if any(token in device for token in ('rknn', 'npu', 'rk35', 'rk3588')):
+        rknn_path = getattr(model, 'rknn_model_path', None)
+        if rknn_path:
+            return rknn_path
     if model.onnx_model_path:
         return model.onnx_model_path
     return model.model_path
@@ -984,6 +997,7 @@ def get_model(model_id):
                 'torchscript_model_path': model.torchscript_model_path,
                 'tensorrt_model_path': model.tensorrt_model_path,
                 'openvino_model_path': model.openvino_model_path,
+                'rknn_model_path': getattr(model, 'rknn_model_path', None),
                 **_serialize_model_class_fields(model),
                 **_serialize_model_provenance(model),
             },
@@ -1098,3 +1112,114 @@ def download_model_forVideo():
             'code': 500,
             'msg': f'服务器内部错误: {str(e)}'
         }), 500
+
+
+# ================= 模型导出（RK3588 .rknn / .onnx）=================
+# 前端契约见 WEB/src/api/device/model.ts 与 WEB/src/views/train/components/ModelExport：
+#   * 创建/状态接口的字段必须放在非空 data 里（axios 会解包成 data.data）；
+#   * 列表接口必须同时给出顶层 total 与 data.items（axios 见到 total 会保留 data 包装）。
+@model_bp.route('/export/<int:model_id>/export/<export_format>', methods=['POST'])
+def submit_model_export(model_id, export_format):
+    """提交模型导出任务（后台异步转换，立即返回 PENDING 记录）。"""
+    try:
+        payload = request.get_json(silent=True) or {}
+        task = model_export_service.create_export_task(model_id, export_format, payload)
+        return jsonify({'code': 0, 'msg': '导出任务已提交', 'data': task})
+    except model_export_service.ExportError as e:
+        return jsonify({'code': 400, 'msg': str(e)}), 400
+    except Exception as e:
+        logger.error(f'提交模型导出失败 model_id={model_id}: {e}', exc_info=True)
+        return jsonify({'code': 500, 'msg': f'导出任务提交失败: {e}'}), 500
+
+
+@model_bp.route('/export/list', methods=['GET'])
+def list_model_exports():
+    """分页查询模型导出记录。"""
+    try:
+        result = model_export_service.list_exports(
+            model_id=request.args.get('model_id', type=int),
+            export_format=request.args.get('format') or request.args.get('export_format') or '',
+            status=request.args.get('status') or '',
+            search=request.args.get('search', '').strip(),
+            page=request.args.get('page', type=int) or 1,
+            page_size=request.args.get('page_size', type=int) or 10,
+        )
+        return jsonify({
+            'code': 0,
+            'msg': 'success',
+            'data': result,
+            'total': result['total'],
+        })
+    except Exception as e:
+        logger.error(f'查询模型导出列表失败: {str(e)}', exc_info=True)
+        return jsonify({'code': 500, 'msg': f'服务器内部错误: {str(e)}'}), 500
+
+
+@model_bp.route('/export/status/<export_id>', methods=['GET'])
+def get_model_export_status(export_id):
+    """查询单个导出任务状态（前端 5s 轮询）。"""
+    try:
+        task_id = int(export_id)
+    except (TypeError, ValueError):
+        return jsonify({'code': 400, 'msg': f'导出记录 ID 非法: {export_id}'}), 400
+
+    row = model_export_service.get_export(task_id)
+    if row is None:
+        return jsonify({'code': 404, 'msg': f'导出记录不存在: {task_id}'}), 404
+    return jsonify({
+        'code': 0,
+        'msg': 'success',
+        'data': model_export_service.serialize_export(row),
+    })
+
+
+@model_bp.route('/export/download/<export_id>', methods=['GET'])
+def download_model_export(export_id):
+    """下载导出产物（blob）。"""
+    tmp_path = None
+    try:
+        task_id = int(export_id)
+    except (TypeError, ValueError):
+        return jsonify({'code': 400, 'msg': f'导出记录 ID 非法: {export_id}'}), 400
+
+    try:
+        tmp_path, download_name = model_export_service.download_export(task_id)
+    except model_export_service.ExportError as e:
+        logger.warning(f'导出产物下载失败 export_id={task_id}: {e}')
+        return jsonify({'code': 404, 'msg': str(e)}), 404
+    except Exception as e:
+        logger.error(f'导出产物下载异常 export_id={task_id}: {e}', exc_info=True)
+        return jsonify({'code': 500, 'msg': f'服务器内部错误: {str(e)}'}), 500
+
+    @after_this_request
+    def _remove_tmp(response):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return response
+
+    return send_file(
+        tmp_path,
+        as_attachment=True,
+        download_name=download_name,
+        mimetype='application/octet-stream',
+    )
+
+
+@model_bp.route('/export/delete/<export_id>', methods=['DELETE'])
+def delete_model_export(export_id):
+    """删除导出记录及其产物。"""
+    try:
+        task_id = int(export_id)
+    except (TypeError, ValueError):
+        return jsonify({'code': 400, 'msg': f'导出记录 ID 非法: {export_id}'}), 400
+
+    try:
+        label = model_export_service.delete_export(task_id)
+        return jsonify({'code': 0, 'msg': f'已删除 {label} 的导出记录'})
+    except model_export_service.ExportError as e:
+        return jsonify({'code': 404, 'msg': str(e)}), 404
+    except Exception as e:
+        logger.error(f'删除导出记录失败 export_id={task_id}: {e}', exc_info=True)
+        return jsonify({'code': 500, 'msg': f'删除失败: {str(e)}'}), 500

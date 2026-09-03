@@ -65,11 +65,11 @@
         </template>
         <template v-else-if="column.dataIndex === 'status'">
           <a-tag :color="statusColors[record.status]">
-            {{ statusLabels[record.status] }}
+            {{ statusLabels[record.status] || record.status || '--' }}
           </a-tag>
         </template>
         <template v-else-if="column.dataIndex === 'created_at'">
-          {{ formatDate(record.created_at) }}
+          {{ record.created_at ? formatDate(record.created_at) : '-' }}
         </template>
         <template v-else-if="column.dataIndex === 'size'">
           {{ record.size ? formatFileSize(record.size) : '-' }}
@@ -118,6 +118,10 @@
         :wrapper-col="{ span: 16 }"
         @finish="handleExportSubmit"
       >
+        <a-form-item label="导出格式">
+          <a-select v-model:value="selectedFormat" :options="formatOptions" />
+        </a-form-item>
+
         <a-form-item label="目标平台" v-if="selectedFormat === 'rknn'">
           <a-select v-model:value="exportForm.target_platform">
             <a-select-option value="rk3588">RK3588</a-select-option>
@@ -155,7 +159,7 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, reactive, onMounted } from 'vue';
+import { ref, reactive, onMounted, onBeforeUnmount } from 'vue';
 import { useRoute } from 'vue-router';
 import {
   BasicTable,
@@ -166,10 +170,7 @@ import {
   ExportOutlined,
   QuestionCircleOutlined
 } from '@ant-design/icons-vue';
-import {
-  Empty,
-  message
-} from 'ant-design-vue';
+import { message } from 'ant-design-vue';
 import {
   deleteExportedModel,
   downloadExportedModel,
@@ -261,10 +262,11 @@ const [registerTable, { reload, updateTableDataRecord }] = useTable({
       page,
       page_size: pageSize,
     });
-    // 后端返回的是items，需要转换为list
+    // 后端返回的是items，需要转换为list（分页接口保留 data 包装：{ code, data, msg, total }）
+    const payload = res?.data ?? res ?? {};
     return {
-      list: res.data.items || res.data.list || [],
-      total: res.data.total || 0,
+      list: payload.items || payload.list || [],
+      total: payload.total || 0,
     };
   },
   columns: getExportModelColumns(),
@@ -286,8 +288,18 @@ const handleSearch = () => {
 // 选择导出格式
 const handleFormatSelect = ({ key }) => {
   selectedFormat.value = key;
-  exportModalVisible.value = true;
+  openExportModal();
+};
 
+// 打开导出配置弹窗（空状态「立即导出」按钮也走这里）
+function openExportModal() {
+  if (!modelId.value) {
+    message.warning('缺少模型 ID，请从模型列表进入导出页');
+    return;
+  }
+  if (!selectedFormat.value) {
+    selectedFormat.value = 'rknn';
+  }
   // 重置表单
   Object.assign(exportForm, {
     target_platform: 'rk3588',
@@ -296,61 +308,73 @@ const handleFormatSelect = ({ key }) => {
     opset: 12,
     dataset: '',
   });
-};
+  exportModalVisible.value = true;
+}
 
 // 提交导出（重构）
 const handleExportSubmit = async () => {
+  if (!selectedFormat.value) {
+    message.warning('请选择导出格式');
+    return;
+  }
   exportLoading.value = true;
   try {
-    const res = await exportModel(modelId.value, selectedFormat.value, exportForm);
-    message.success('导出任务已提交，请稍后刷新查看');
-
-    // 添加临时记录到表格
-    const tempRecord = {
-      id: Date.now(), // 临时ID
-      exportId: res.exportId,
-      model_name: currentModelName,
-      format: selectedFormat.value,
-      status: exportStatus.PENDING,
-      created_at: new Date().toISOString(),
-      size: 0
-    };
-
-    // 添加到表格数据（伪代码，需根据实际表格实现）
-    addTableRow(tempRecord);
-
-    // 开始轮询状态
-    startPolling(res.exportId);
-  } catch (error) {
-    message.error(`导出失败: ${error.message}`);
+    // 后端返回序列化后的导出记录（同时带 id / exportId 双键名）
+    const task = await exportModel(modelId.value, selectedFormat.value, exportForm);
+    message.success('导出任务已提交，正在转换中…');
+    // 记录已由后端落库，直接刷新列表拿到真实 ID，避免临时行与 rowKey 对不上
+    await reload();
+    startPolling(getExportId(task));
+  } catch (error: any) {
+    message.error(`导出失败: ${getErrorMessage(error)}`);
   } finally {
     exportLoading.value = false;
     exportModalVisible.value = false;
   }
 };
 
-// 状态轮询（新增）
-const startPolling = (exportId: string) => {
-  const pollingInterval = setInterval(async () => {
+// 状态轮询
+const pollingTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+const stopPolling = (exportId: string | number) => {
+  const timer = pollingTimers.get(String(exportId));
+  if (timer) {
+    clearInterval(timer);
+    pollingTimers.delete(String(exportId));
+  }
+};
+
+const startPolling = (exportId: string | number) => {
+  if (exportId === undefined || exportId === null || exportId === '') return;
+  stopPolling(exportId);
+  const timer = setInterval(async () => {
     try {
       const statusRes = await getExportStatus(exportId);
+      if (!statusRes) return;
 
-      // 更新表格中对应记录的状态
-      updateRecordStatus(exportId, statusRes.status, statusRes.size);
+      // 原地更新当前页中对应记录的状态
+      updateRecordStatus(exportId, statusRes);
 
-      if (statusRes.status === exportStatus.COMPLETED ||
-        statusRes.status === exportStatus.FAILED) {
-        clearInterval(pollingInterval);
-
-        if (statusRes.status === exportStatus.FAILED) {
-          message.error(`导出失败: ${statusRes.errorMessage}`);
-        }
+      if (statusRes.status === exportStatus.COMPLETED) {
+        stopPolling(exportId);
+        message.success(`${statusRes.model_name || '模型'} 导出完成`);
+        reload();
+      } else if (statusRes.status === exportStatus.FAILED) {
+        stopPolling(exportId);
+        message.error(`导出失败: ${statusRes.errorMessage || statusRes.error_message || '未知原因'}`);
       }
     } catch (error) {
       console.error('状态检查失败', error);
+      stopPolling(exportId);
     }
   }, 5000); // 每5秒检查一次
+  pollingTimers.set(String(exportId), timer);
 };
+
+onBeforeUnmount(() => {
+  pollingTimers.forEach((_, key) => stopPolling(key));
+  pollingTimers.clear();
+});
 
 // 下载模型（重构）
 const handleDownload = async (record) => {
@@ -358,10 +382,20 @@ const handleDownload = async (record) => {
     message.warning('导出任务尚未完成，请稍后再试');
     return;
   }
+  const exportId = getExportId(record);
+  if (exportId === undefined || exportId === null) {
+    message.error('导出记录缺少 ID，无法下载');
+    return;
+  }
 
   try {
-    // 调用新接口获取文件流
-    const blob = await downloadExportedModel(record.exportId);
+    // 调用新接口获取文件流（isTransformResponse=false 时返回的是原生响应，需再取 data）
+    const response: any = await downloadExportedModel(exportId);
+    const blob: Blob = response instanceof Blob ? response : response?.data;
+    if (!(blob instanceof Blob)) {
+      message.error('下载失败：返回内容不是文件流');
+      return;
+    }
 
     // 创建下载链接
     const url = URL.createObjectURL(blob);
@@ -378,15 +412,16 @@ const handleDownload = async (record) => {
     }, 100);
 
     message.success('文件下载成功');
-  } catch (error) {
+  } catch (error: any) {
     // 细化错误处理
-    if (error.response?.status === 404) {
+    const status = error?.response?.status ?? error?.status;
+    if (status === 404) {
       message.error('文件不存在，请重新导出');
-      updateRecordStatus(record.exportId, exportStatus.FAILED);
-    } else if (error.response?.status === 403) {
+      reload();
+    } else if (status === 403) {
       message.error('无下载权限，请联系管理员');
     } else {
-      message.error(`下载失败: ${error.message}`);
+      message.error(`下载失败: ${getErrorMessage(error)}`);
     }
   }
 };
@@ -395,6 +430,7 @@ const handleDownload = async (record) => {
 const handleDelete = async (record) => {
   try {
     await deleteExportedModel(record.id);
+    stopPolling(getExportId(record));
     message.success(`已删除 ${record.model_name} 的导出记录`);
     reload();
   } catch (error) {
@@ -402,6 +438,13 @@ const handleDelete = async (record) => {
     console.error('模型删除异常:', error);
   }
 };
+
+// 辅助函数：导出记录 ID（后端 id / exportId 双键名）
+const getExportId = (record: any) => record?.exportId ?? record?.export_id ?? record?.id;
+
+// 辅助函数：从 axios / 业务异常里取可读信息
+const getErrorMessage = (error: any) =>
+  error?.response?.data?.msg || error?.msg || error?.message || '未知错误';
 
 // 辅助函数：获取文件扩展名（新增）
 const getFileExtension = (format: string) => {
@@ -424,18 +467,15 @@ const formatFileSize = (bytes: number) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 };
 
-// 日期格式化（优化）
+// 日期格式化
 const formatDate = (dateString: string) => {
-  return dayjs(dateString).fromNow() + ` (${dayjs(dateString).format('MM-DD HH:mm')})`;
+  const d = dayjs(dateString);
+  return d.isValid() ? d.format('YYYY-MM-DD HH:mm:ss') : String(dateString ?? '-');
 };
 
-// 表格操作方法（新增）
-const addTableRow = (record) => {
-  // 根据实际表格组件的API实现添加行逻辑
-};
-
-const updateRecordStatus = (exportId: string, status: string, size?: number) => {
-  // 根据实际表格组件的API实现更新行逻辑
+// 用后端最新的导出记录刷新表格中对应行（行不在当前页时返回 undefined，忽略即可）
+const updateRecordStatus = (exportId: string | number, record: any) => {
+  updateTableDataRecord(Number(exportId), record);
 };
 </script>
 

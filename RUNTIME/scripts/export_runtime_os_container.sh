@@ -111,6 +111,7 @@ docker run --rm \
   -e ORT_ROOT=/opt/ort \
   -e ORT_VERSION="$ORT_VER" \
   -e MINICONDA_PREFIX=/opt/miniconda3 \
+  -e RUNTIME_WITH_RKNN="${RUNTIME_WITH_RKNN:-auto}" \
   -v "$REPO:/src:rw" \
   -v "$ORT_HOST_DIR:/opt/ort:ro" \
   -v "$CONDA_VOL:/opt/miniconda3:rw" \
