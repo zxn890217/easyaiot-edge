@@ -104,12 +104,15 @@ wire_runtime_override() {
 
   # Rockchip NPU (RK3588/RK356x): mount librknnrt.so + the device nodes the driver needs.
   # Only exist-verified nodes are added, otherwise docker-compose fails to start the service.
-  local rknn_host="" rknn_volume_line=""
+  #
+  # 重要：只挂载 librknnrt.so 文件本身，不要挂整个系统库目录（如 /usr/lib/aarch64-linux-gnu）。
+  # 系统目录包含 libc.so.6 / libstdc++.so 等基础库，与容器基础镜像的版本冲突会导致 SIGSEGV。
+  local rknn_file="" rknn_volume_line=""
   for cand in /usr/lib/librknnrt.so /usr/local/lib/librknnrt.so \
               /usr/lib/aarch64-linux-gnu/librknnrt.so /oem/usr/lib/librknnrt.so \
               /vendor/usr/lib/librknnrt.so "${RUNTIME_HOST_DIR}/lib/librknnrt.so"; do
     if [[ -f "$cand" ]]; then
-      rknn_host="$(dirname "$cand")"
+      rknn_file="$cand"
       break
     fi
   done
@@ -125,10 +128,10 @@ wire_runtime_override() {
     if [[ -e "$render" ]]; then device_nodes+=("$render"); fi
   done
 
-  if [[ -n "$rknn_host" ]]; then
+  if [[ -n "$rknn_file" ]]; then
     ld_path="${ld_path}:/opt/easyaiot/rknn-lib"
-    rknn_volume_line="      - ${rknn_host}:/opt/easyaiot/rknn-lib:ro"
-    print_info "检测到 Rockchip NPU 运行时 ($rknn_host)，已为 VIDEO 容器开启 NPU 通路"
+    rknn_volume_line="      - ${rknn_file}:/opt/easyaiot/rknn-lib/librknnrt.so:ro"
+    print_info "检测到 Rockchip NPU 运行时 ($rknn_file)，已为 VIDEO 容器开启 NPU 通路"
     if [[ ${#device_nodes[@]} -eq 0 ]]; then
       print_warning "未找到 /dev/rga、/dev/rknpu 等 NPU 设备节点；容器内 RUNTIME 会自动回落 ONNX Runtime"
     fi
