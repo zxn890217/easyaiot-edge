@@ -92,11 +92,12 @@
 </template>
 
 <script lang="ts" setup>
-import { useId } from 'vue';
+import { getCurrentInstance } from 'vue';
 
 defineOptions({ name: 'CameraDeviceIcon' });
 
-const uid = useId().replace(/:/g, '');
+// useId 是 Vue 3.5 API；本项目 vue 锁定 3.4.38，改用实例级唯一 uid（useId 的底层来源）
+const uid = `cdi-${getCurrentInstance()?.uid ?? 0}`;
 
 withDefaults(
   defineProps<{

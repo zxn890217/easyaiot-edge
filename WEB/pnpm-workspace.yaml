@@ -3,6 +3,10 @@ nodeLinker: hoisted
 shamefullyHoist: true
 # Docker/BuildKit 内 symlink 链入 store 易在 install 结束后长时间无输出挂起，copy 更稳
 package-import-method: copy
+# babel-plugin-jsx 1.1.5 有丢用户 "from 'vue'" import 的 bug（tsx SFC 产物出现裸
+# defineComponent → 运行时 ReferenceError），强制升到 1.x 最新修复版
+overrides:
+  '@vue/babel-plugin-jsx': 1.5.0
 allowBuilds:
   '@parcel/watcher': true
   core-js: true
