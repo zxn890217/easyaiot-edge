@@ -59,8 +59,8 @@ TASK/build-linux/
 TASK/build/
 TASK/cmake-build-debug/
 
-# pnpm lockfile (WEB)
-WEB/pnpm-lock.yaml
+# pnpm lockfile (WEB) 必须纳入版本库：WEB/Dockerfile COPY + --frozen-lockfile 依赖它
+# （历史上的 WEB/pnpm-lock.yaml 忽略规则会导致 docker 构建 COPY 失败，已移除）
 DEVICE/server
 
 # 本地构建缓存与依赖（onnxruntime 等第三方库）
