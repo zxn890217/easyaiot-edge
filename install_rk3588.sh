@@ -13,6 +13,7 @@
 #   ./install_rk3588.sh update               # git pull → build → 重启服务 → verify
 #   ./install_rk3588.sh verify               # NPU 端到端校验（容器设备/librknnrt/后端回落/健康）
 #   ./install_rk3588.sh npu                  # NPU 设备节点、librknnrt 版本、三核负载一览
+#   ./install_rk3588.sh sdk-setup          # 扫描本机现成 rknpu2 SDK 并落到 RUNTIME/.rknn-sdk
 #   ./install_rk3588.sh runtime-bundle X.tgz # 用离线包更新 /opt/easyaiot/RUNTIME（OTA 场景）
 #   ./install_rk3588.sh model-export         # 打印 .rknn 转换的正确姿势（只能在 x86 控制面做）
 #   ./install_rk3588.sh status|logs|restart|start|stop
@@ -20,8 +21,11 @@
 # 环境变量:
 #   RKNN_SDK_ROOT          rknpu2 SDK 目录（其下有 include/rknn_api.h）。留空自动探测，
 #                          约定落点 RUNTIME/.rknn-sdk —— docker 编译时它随 /src 一起进容器
-#   RUNTIME_WITH_RKNN      on(默认) / auto / off
-#                          on：缺 SDK 直接失败，避免静默编出无 NPU 后端的二进制（盒子只能跑 CPU）
+#   RUNTIME_WITH_RKNN      auto(默认) / on / off
+#                          auto：有 SDK 就编 NPU 后端，没有则编纯 ONNX Runtime 并大字告警
+#                          on  ：缺 SDK 直接失败（CI/出包机用，避免产出无 NPU 后端的二进制）
+#                          多数盒子镜像只装了 librknnrt.so（运行期）而没有 rknn_api.h（编译期），
+#                          先跑 ./install_rk3588.sh sdk-setup 补 SDK，再 build 即可上 NPU
 #   RUNTIME_INFER_BACKEND  auto(默认) / rknn / onnx —— 透传给 VIDEO 控制面与 RUNTIME
 #   RUNTIME_NPU_CORE_MASK  auto(默认) / all / per_thread / core0 / core1 / core2 / core0_1
 #   EASYAIOT_RUNTIME_BUILD_MODE  docker(默认，与 VIDEO 同源 glibc) / host(需 conda)
@@ -58,7 +62,7 @@ source "$SCRIPT_DIR/RUNTIME/scripts/rknn_sdk.sh"
 source "$SCRIPT_DIR/.scripts/docker/module_update_helpers.sh"
 
 WEB_PORT="${WEB_PORT:-8888}"
-RUNTIME_WITH_RKNN="${RUNTIME_WITH_RKNN:-on}"
+RUNTIME_WITH_RKNN="${RUNTIME_WITH_RKNN:-auto}"
 export WEB_PORT RUNTIME_WITH_RKNN
 
 RUNTIME_BIN_PATH="$SCRIPT_DIR/RUNTIME/build/RUNTIME"
@@ -140,8 +144,8 @@ check_npu_driver() {
     if lib="$(rknn_runtime_lib)"; then
         printf '  运行时库  : %s\n' "$lib"
         local ver
-        ver="$(strings -a "$lib" 2>/dev/null | grep -m1 -i 'librknnrt version' || true)"
-        [ -n "$ver" ] && printf '  库版本    : %s\n' "$ver"
+        ver="$(librknnrt_version "$lib")"
+        printf '  库版本    : %s\n' "${ver:-未知（librknnrt.so 里没读到版本串）}"
     else
         error "  未找到 librknnrt.so：RUNTIME 会回落 ONNX Runtime CPU，NPU 用不上"
         error "  装法：把 rknpu2 的 runtime/RK3588/Linux/librknn_api/aarch64/librknnrt.so"
@@ -170,17 +174,122 @@ check_rknn_sdk() {
         return 0
     fi
     error "  未找到 rknpu2 SDK（rknn_api.h），RUNTIME 编不出 RKNN 后端"
-    error "  取 SDK：Rockchip 官方 rknpu2 包的 runtime/RK3588/Linux/librknn_api"
-    error "          （内含 include/rknn_api.h 与 aarch64/librknnrt.so）"
-    error "  摆放（二选一）："
-    error "    1) mkdir -p RUNTIME/.rknn-sdk && cp -a <SDK>/include <SDK>/aarch64 \"$PWD/RUNTIME/.rknn-sdk/\""
-    error "       （docker 编译模式唯一可行做法，目录已在 .gitignore 内）"
-    error "    2) export RKNN_SDK_ROOT=/path/to/librknn_api"
+    error "  盒子镜像通常只带运行期 librknnrt.so，编译期头文件要自己补："
+    error "    1) ./install_rk3588.sh sdk-setup    # 先扫本机有没有现成 SDK"
+    error "    2) 没有就下一份（盒子能上网时）："
+    error "       git clone --depth 1 https://github.com/rockchip-linux/rknpu2 /tmp/rknpu2"
+    error "       RKNN_SDK_DIR=/tmp/rknpu2/runtime/RK3588/Linux/librknn_api \\"
+    error "         ./install_rk3588.sh sdk-setup"
+    error "    3) 已有 SDK 只想临时指路：export RKNN_SDK_ROOT=/path/to/librknn_api"
+    error "  离线盒子：在 x86 上 clone 后 scp runtime/RK3588/Linux/librknn_api 过来再做 2)"
     if [ "$(printf '%s' "$RUNTIME_WITH_RKNN" | tr '[:upper:]' '[:lower:]')" = "auto" ]; then
-        warn "  RUNTIME_WITH_RKNN=auto：将继续编纯 ONNX Runtime 版本"
+        warn "  RUNTIME_WITH_RKNN=auto：本次继续编纯 ONNX Runtime（CPU），$0 verify 会明确指出没上 NPU"
+        warn "  想让缺 SDK 变成硬失败（CI/出包机）：RUNTIME_WITH_RKNN=on $0 build"
         return 0
     fi
     return 1
+}
+
+# 在有 rknn_api.h 的路径里挑出 SDK 根：三种官方布局都要还原成 <root>
+#   <root>/include/rknn_api.h  <root>/rknpu2/include/rknn_api.h  <root>/librknn_api/include/rknn_api.h
+sdk_root_of_header() {
+    sed -e 's#/librknn_api/include/rknn_api\.h$##' \
+        -e 's#/rknpu2/include/rknn_api\.h$##' \
+        -e 's#/include/rknn_api\.h$##'
+}
+
+# 扫本机现成的 rknn_api.h：厂商 SDK、rknpu2 解压包、conda 环境里都可能出现。
+# 限定深度，避免在大目录上跑飞。
+sdk_scan_headers() {
+    local root
+    for root in /opt /usr/local /usr/include /srv /home /root /userdata /data \
+                /oem /vendor /workspace /work; do
+        [ -d "$root" ] || continue
+        # 深度放到 8：真实布局常在 ~/rknn-toolkit2/rknpu2/runtime/RK3588/Linux/librknn_api/include
+        find "$root" -maxdepth 8 \
+            \( -name .git -o -name node_modules -o -name site-packages -o -name .build-cache \) -prune -o \
+            \( -type f -o -type l \) -name rknn_api.h -print 2>/dev/null
+    done
+}
+
+# 把 SDK 整理成 RUNTIME/.rknn-sdk/{include,lib}：docker 编译模式唯一稳的做法
+sdk_setup() {
+    step "准备编译期 RKNN SDK → RUNTIME/.rknn-sdk"
+    local target="$SCRIPT_DIR/RUNTIME/.rknn-sdk" src="" hits
+    if [ -n "${RKNN_SDK_DIR:-}" ]; then
+        [ -d "$RKNN_SDK_DIR" ] || { error "  RKNN_SDK_DIR 不存在: $RKNN_SDK_DIR"; return 1; }
+        src="$RKNN_SDK_DIR"
+        info "  使用显式指定的 SDK: $src"
+    else
+        hits="$(sdk_scan_headers | sdk_root_of_header | sort -u || true)"
+        if [ -z "$hits" ]; then
+            error "  本机没搜到 rknn_api.h（厂商镜像通常不带编译期头文件）"
+            error "  下一份官方 SDK 再跑本命令："
+            error "    git clone --depth 1 https://github.com/rockchip-linux/rknpu2 /tmp/rknpu2"
+            error "    RKNN_SDK_DIR=/tmp/rknpu2/runtime/RK3588/Linux/librknn_api $0 sdk-setup"
+            error "  离线盒子：x86 上 clone 后 scp 该 librknn_api 目录过来（约 8 MB）"
+            return 1
+        fi
+        printf '  搜到候选 SDK 根目录：\n'
+        printf '%s\n' "$hits" | sed 's/^/    /'
+        src="$(printf '%s\n' "$hits" | head -n1)"
+        info "  取第一个：$src（换别的用 RKNN_SDK_DIR=/path $0 sdk-setup）"
+    fi
+    # 头文件：三种布局都试
+    local inc="" cand
+    if [ "$src" = "$target" ] || [ "$src" = "$target/include" ]; then
+        success "  RUNTIME/.rknn-sdk 已就绪，无需重复拷贝"
+        export RKNN_SDK_ROOT="$target"
+        return 0
+    fi
+    for cand in "$src/include" "$src/rknpu2/include" "$src/librknn_api/include"; do
+        [ -f "$cand/rknn_api.h" ] && { inc="$cand"; break; }
+    done
+    if [ -z "$inc" ]; then
+        # 允许直接指向头文件所在目录
+        [ -f "$src/rknn_api.h" ] && inc="$src"
+    fi
+    [ -n "$inc" ] || { error "  $src 下找不到 rknn_api.h（应指向含 include/ 的 SDK 根）"; return 1; }
+    mkdir -p "$target/include" "$target/lib" || { error "  无法创建 $target"; return 1; }
+    cp -aL "$inc"/. "$target/include"/ 2>/dev/null || { error "  拷贝头文件失败"; return 1; }
+    success "  头文件 → $target/include（$(find "$target/include" -name '*.h' | wc -l) 个 .h）"
+    # 链接期用的 .so：优先 SDK 自带的 aarch64 版本，其次盒子驱动那份
+    local lib="" l
+    for l in "$src/librknn_api/aarch64/librknnrt.so" "$src/aarch64/librknnrt.so" \
+             "$src/lib/librknnrt.so" "$src/rknpu2/lib/librknnrt.so"; do
+        [ -f "$l" ] && { lib="$l"; break; }
+    done
+    if [ -z "$lib" ]; then
+        lib="$(rknn_system_runtime_lib 2>/dev/null || true)"
+        [ -n "$lib" ] && info "  SDK 内无 librknnrt.so，改用盒子驱动那份做链接桩: $lib"
+    fi
+    if [ -n "$lib" ]; then
+        cp -aL "$lib" "$target/lib/librknnrt.so" 2>/dev/null \
+            && success "  链接库 → $target/lib/librknnrt.so" \
+            || warn "  拷贝 librknnrt.so 失败，cmake 需自行在系统路径找到它"
+    else
+        error "  既没找到 SDK 的 librknnrt.so，盒子上也还没有运行期驱动库"
+        error "  编译期会过不了 find_library(rknnrt)；请确认 rknpu2 驱动已装（$0 npu 查看）"
+        return 1
+    fi
+    # 版本不一致只影响运行期：cmake 链接用 SDK 的，ld.so 实际加载哪份看 LD_LIBRARY_PATH
+    local sdk_ver="" drv_ver="" sys_lib
+    sdk_ver="$(librknnrt_version "$target/lib/librknnrt.so")"
+    if sys_lib="$(rknn_system_runtime_lib 2>/dev/null)"; then
+        drv_ver="$(librknnrt_version "$sys_lib")"
+    fi
+    [ -n "$sdk_ver" ] && printf '  SDK 库版本: %s\n' "$sdk_ver"
+    if [ -n "$sys_lib" ]; then
+        printf '  盒子库版本: %s (%s)\n' "${drv_ver:-unknown}" "$sys_lib"
+    else
+        warn "  盒子系统路径（/usr/lib 等）没有 librknnrt.so：编译能过，运行期需把 LD_LIBRARY_PATH 指向上面这份"
+    fi
+    if [ -n "$sdk_ver" ] && [ -n "$drv_ver" ] && [ "$sdk_ver" != "$drv_ver" ]; then
+        warn "  两者版本不同：运行期以盒子驱动（内核 rknpu）那份为准"
+        warn "  若跑起来报 RKNN_ERR_DEVICE_UNMATCH，换成与驱动同版本的 rknpu2 SDK 重编即可"
+    fi
+    export RKNN_SDK_ROOT="$target"
+    info "  完成。接着跑：$0 build"
 }
 
 check_resources() {
@@ -323,20 +432,30 @@ build_runtime_arm() {
         warn "EASYAIOT_RUNTIME_SKIP=1，跳过 RUNTIME 编译"
         return 0
     fi
-    step "编译 RUNTIME（RKNN NPU 后端，RUNTIME_WITH_RKNN=$RUNTIME_WITH_RKNN）"
+    step "编译 RUNTIME（RUNTIME_WITH_RKNN=$RUNTIME_WITH_RKNN）"
     if ! bash RUNTIME/install_linux.sh build; then
         error "RUNTIME 编译失败"
         return 1
     fi
-    local rc=0
+    local rc=0 want
+    want="$(printf '%s' "$RUNTIME_WITH_RKNN" | tr '[:upper:]' '[:lower:]')"
     runtime_has_rknn || rc=$?
-    if [ "$rc" != "0" ]; then
-        error "编译完成但二进制里没有 RKNN 后端，NPU 不会生效"
-        [ "$rc" = "2" ] && error "  产物缺失：$RUNTIME_BIN_PATH"
-        [ "$rc" = "1" ] && error "  多半是 SDK 没被容器看到：见 RUNTIME/scripts/rknn_sdk.sh 的探测路径"
+    if [ "$rc" = "2" ]; then
+        error "  产物缺失：$RUNTIME_BIN_PATH"
         return 1
     fi
-    success "RUNTIME 已带 RKNN 后端"
+    if [ "$rc" = "1" ]; then
+        if [ "$want" = "on" ]; then
+            error "编译完成但二进制里没有 RKNN 后端，NPU 不会生效"
+            error "  多半是 SDK 没被容器看到：见 RUNTIME/scripts/rknn_sdk.sh 的探测路径"
+            return 1
+        fi
+        warn "编译完成，但二进制未链接 librknnrt —— 本次是纯 ONNX Runtime（CPU）版本"
+        [ "$want" != "off" ] && warn "  上 NPU：$0 sdk-setup 补齐 rknpu2 SDK（rknn_api.h）后重跑 $0 build"
+        warn "  现在也能用：视频算法任务照跑，只是不占 NPU 算力；随时用 $0 verify 复核"
+    else
+        success "RUNTIME 已带 RKNN 后端"
+    fi
     return 0
 }
 
@@ -602,8 +721,8 @@ EOF
 }
 
 usage() {
-    # 头部注释块为 2-32 行（32 行为收尾的 # ===），改注释时同步这里
-    sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,2\} \{0,1\}//'
+    # 头部注释块为 2-36 行（36 行为收尾的 # ===），改注释时同步这里
+    sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,2\} \{0,1\}//'
 }
 
 run_container_cmd() {
@@ -618,6 +737,7 @@ main() {
     case "$cmd" in
         doctor)   doctor_all ;;
         npu)      npu_snapshot ;;
+        sdk-setup) sdk_setup ;;
         build)    export_rknn_env && build_images && wire_npu_mount && verify_host_side ;;
         install)  export_rknn_env && install_all && verify_all ;;
         update)   export_rknn_env && update_all ;;

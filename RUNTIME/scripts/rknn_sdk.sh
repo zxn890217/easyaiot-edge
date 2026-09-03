@@ -8,6 +8,8 @@
 #   rknn_sdk_probe       打印可用的 rknpu2 SDK 根目录（其下能找到 rknn_api.h），找不到返回 1
 #   rknn_header_found    编译期能否找到 rknn_api.h（SDK 目录或系统 include）
 #   rknn_runtime_lib     打印运行期 librknnrt.so 路径，找不到返回 1
+#   rknn_system_runtime_lib  只要系统路径（/usr/lib 等）里那份，不含 SDK 目录副本
+#   librknnrt_version    从 librknnrt.so 里取出版本号（比对 SDK 与盒子驱动用）
 #   npu_device_nodes     逐行打印存在的 NPU / RGA / MPP 设备节点
 #   npu_core_mask_normalize  把可读别名（all/core0/core0_1...）归一化成 RUNTIME 认得的值
 
@@ -59,9 +61,10 @@ rknn_header_found() {
   return 1
 }
 
-# 运行期库：正常由盒子上的 rknpu2 驱动提供；离线/精简镜像可能只落在 SDK 目录里
-rknn_runtime_lib() {
-  local cand sdk
+# 盒子系统路径里那份 librknnrt.so（由 rknpu2 驱动/厂包安装，运行期 ld.so 真正加载的就是它）。
+# 不含 SDK 目录内的副本 —— 比对驱动与 SDK 版本时必须只用这一个来源。
+rknn_system_runtime_lib() {
+  local cand
   for cand in /usr/lib/librknnrt.so /usr/local/lib/librknnrt.so \
               /usr/lib/aarch64-linux-gnu/librknnrt.so \
               /oem/usr/lib/librknnrt.so /vendor/usr/lib/librknnrt.so; do
@@ -70,6 +73,14 @@ rknn_runtime_lib() {
       return 0
     fi
   done
+  return 1
+}
+
+# 运行期库：正常由盒子上的 rknpu2 驱动提供；离线/精简镜像可能只落在 SDK 目录里
+rknn_runtime_lib() {
+  local cand sdk
+  cand="$(rknn_system_runtime_lib || true)"
+  [[ -n "$cand" ]] && { printf '%s\n' "$cand"; return 0; }
   sdk="$(rknn_sdk_probe || true)"
   [[ -n "$sdk" ]] || return 1
   for cand in "$sdk/lib/librknnrt.so" "$sdk/rknpu2/lib/librknnrt.so" \
@@ -80,6 +91,20 @@ rknn_runtime_lib() {
     fi
   done
   return 1
+}
+
+# librknnrt.so 里带一行 "librknnrt version: 1.6.0 (…)"，取出版本号用于比对驱动/SDK。
+# 优先 strings（二进制友好）；没有 binutils 时退回 grep -a。都取不到就打印空。
+librknnrt_version() {
+  local lib="${1:-}" raw=""
+  [ -f "$lib" ] || return 0
+  if command -v strings >/dev/null 2>&1; then
+    raw="$(strings -a "$lib" 2>/dev/null | grep -m1 -i 'librknnrt version' || true)"
+  else
+    raw="$(LC_ALL=C grep -a -m1 -o 'librknnrt version: *[0-9][0-9.]*' "$lib" 2>/dev/null || true)"
+  fi
+  [ -n "$raw" ] || return 0
+  printf '%s\n' "$raw" | grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
 
 # 只列真实存在的节点：docker-compose 的 devices: 写不存在的节点会直接起不来服务

@@ -15,9 +15,9 @@
 #       默认 docker：在 VIDEO 同源容器内用系统 g++ 编译（推荐，免 sysroot 降级）
 #       host：本机 conda 编译（新 glibc 主机上产物可能无法进 VIDEO 容器）
 #   EASYAIOT_RUNTIME_BUILD_IMAGE         # 覆盖构建镜像（默认优先 video-service:latest）
-#   RUNTIME_WITH_RKNN=auto|on|off        # Rockchip NPU 后端；auto=本机有 rknn_api.h 就开
+#   RUNTIME_WITH_RKNN=auto|on|off        # Rockchip NPU 后端；默认 auto=探到 rknn_api.h 才开；on=缺 SDK 直接失败
 #   RKNN_SDK_ROOT                        # rknpu2 SDK 目录（含 include/rknn_api.h）
-#       docker 编译模式下 SDK 必须能被容器看到：放 RUNTIME/.rknn-sdk 最省事（随 /src 挂载）
+#       docker 编译时容器看不到宿主 /usr/include：仓库根 ./install_rk3588.sh sdk-setup 落到 RUNTIME/.rknn-sdk
 #   EASYAIOT_RUNTIME_DEPLOY_MODE=integrated
 #       云边一体：需 VIDEO/Gateway/MQTT/SRS 地址，本机只装 RUNTIME
 #       纯边缘形态请用平台安装：bash .scripts/docker/install_linux.sh install（选 edge → standalone）
@@ -807,8 +807,9 @@ build_runtime_in_docker() {
   # Rockchip NPU：容器里也得有 rknn_api.h / librknnrt.so，否则 auto 模式会静默编出
   # 没有 NPU 后端的二进制（盒子上跑 ONNX Runtime CPU，NPU 白装）。
   # SDK 在仓库内时它本就随 /src 一起挂载，只换算容器内路径；在仓库外则按原路径只读挂入。
-  local rknn_sdk
+  local rknn_sdk rknn_want
   rknn_sdk="$(rknn_sdk_probe || true)"
+  rknn_want="$(printf '%s' "${RUNTIME_WITH_RKNN:-auto}" | tr '[:upper:]' '[:lower:]')"
   if [[ -n "$rknn_sdk" ]]; then
     case "$rknn_sdk" in
       "$REPO"/*)
@@ -819,10 +820,18 @@ build_runtime_in_docker() {
         ;;
     esac
     print_info "RKNN SDK 已提供给构建容器: $rknn_sdk"
-  elif [[ "$(printf '%s' "${RUNTIME_WITH_RKNN:-auto}" | tr '[:upper:]' '[:lower:]')" =~ ^(on|1|true|yes)$ ]]; then
-    print_warning "RUNTIME_WITH_RKNN=on，但未找到 RKNN SDK；容器内 cmake 将因缺 rknn_api.h 失败"
-    print_warning "  获取：rkpack/rknpu2 的 runtime/RK3588/Linux/librknn_api，或 RK_SDK 内 rknpu2 目录"
-    print_warning "  放到仓库内 RUNTIME/.rknn-sdk 即可自动识别（docker 编译无需额外挂载）"
+  elif [[ "$rknn_want" =~ ^(on|1|true|yes)$ ]]; then
+    print_error "RUNTIME_WITH_RKNN=on，但主机上找不到 rknpu2 SDK；容器内 cmake 会因缺 rknn_api.h 失败"
+    print_error "  取 SDK：git clone --depth 1 https://github.com/rockchip-linux/rknpu2"
+    print_error "        用其中 runtime/RK3588/Linux/librknn_api（include/ + aarch64/librknnrt.so）"
+    print_error "  放法：仓库根执行 ./install_rk3588.sh sdk-setup（自动扫描并落到 RUNTIME/.rknn-sdk），"
+    print_error "        或 export RKNN_SDK_ROOT=/path/to/librknn_api（容器外路径会自动只读挂入）"
+    print_error "  注意：盒子系统 /usr/include 里的头文件对 docker 编译无效，容器看不到宿主 rootfs"
+    print_error "  只想先跑通 CPU 推理：RUNTIME_WITH_RKNN=auto 重试"
+    return 1
+  elif [[ "$rknn_want" != "off" ]]; then
+    print_warning "未找到 RKNN SDK（rknn_api.h）：本次只编 ONNX Runtime CPU 后端，NPU 不生效"
+    print_warning "  补齐后重跑本命令即可启用 NPU：仓库根 ./install_rk3588.sh sdk-setup"
   fi
   docker_opts+=(-e "RUNTIME_WITH_RKNN=${RUNTIME_WITH_RKNN:-auto}")
 
