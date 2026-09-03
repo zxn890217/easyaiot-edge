@@ -73,8 +73,6 @@ export default ({ command, mode }: ConfigEnv): UserConfig => {
       target: 'esnext',
       cssTarget: 'chrome80',
       outDir: OUTPUT_DIR,
-      // 临时排障开关：诊断 defineComponent is not defined 用，定位后改回 false
-      sourcemap: true,
       // minify: 'terser',
       /**
        * 当 minify=“minify:'terser'” 解开注释
