@@ -117,15 +117,28 @@ wire_runtime_override() {
     fi
   done
 
-  # /dev/dri is a directory, so compose's "devices:" mapping must point at the render
-  # node itself (RK3588 exposes the NPU/GPU DRM node as /dev/dri/renderD128).
+  # /dev/dri 不能只透传 renderD*：RK3588 上 librknnrt 实际打开的是 RKNPU 的 DRM card
+  # 主节点（实测宿主 rknn_init 后 fd 指向 /dev/dri/card1）。docker 的 devices: 精确到
+  # major:minor，缺 card 节点时容器内固定报「failed to open rknn device」。
+  # 判据统一放在 VIDEO/scripts/npu_drm_nodes.sh，与 RUNTIME/scripts/rknn_sdk.sh 共用。
   local -a device_nodes=()
-  local node render
+  local -a npu_card_nodes=()
+  local node render npu_card
   for node in /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service; do
     if [[ -e "$node" ]]; then device_nodes+=("$node"); fi
   done
   for render in /dev/dri/renderD*; do
     if [[ -e "$render" ]]; then device_nodes+=("$render"); fi
+  done
+  if [[ -f "${VIDEO_DIR}/scripts/npu_drm_nodes.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "${VIDEO_DIR}/scripts/npu_drm_nodes.sh"
+    while IFS= read -r npu_card; do
+      if [[ -n "$npu_card" ]]; then npu_card_nodes+=("$npu_card"); fi
+    done <<< "$(npu_drm_card_nodes)"
+  fi
+  for npu_card in ${npu_card_nodes[@]+"${npu_card_nodes[@]}"}; do
+    device_nodes+=("$npu_card")
   done
 
   if [[ -n "$rknn_file" ]]; then
@@ -180,6 +193,12 @@ wire_runtime_override() {
       for node in "${device_nodes[@]}"; do
         echo "      - ${node}:${node}"
       done
+      # RK3588 的 RGA/MPP 走 DMA-BUF 锁页，容器默认 memlock 只有 64KiB
+      # （宿主是 64MiB），缓冲区导出会偶发失败，这里直接放到不限。
+      echo "    ulimits:"
+      echo "      memlock:"
+      echo "        soft: -1"
+      echo "        hard: -1"
     fi
     echo "    environment:"
     echo "      - RUNTIME_BIN=/opt/easyaiot/RUNTIME/build/RUNTIME"

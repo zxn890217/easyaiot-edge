@@ -137,7 +137,7 @@ check_npu_driver() {
         [ -n "$node" ] && printf '  设备节点  : %s\n' "$node"
     done <<< "$(npu_device_nodes)"
     if [ -z "$(npu_device_nodes)" ]; then
-        error "  未找到 /dev/rga、/dev/rknpu、/dev/mpp_service、/dev/dri/renderD* 任一节点"
+        error "  未找到 /dev/rga、/dev/rknpu、/dev/mpp_service、/dev/dri/renderD*、/dev/dri/card* 任一节点"
         error "  请确认内核已加载 rknpu / rga / rkmpp 驱动（厂商固件或 rkdeveloptool 刷的镜像）"
         rc=1
     fi
@@ -536,6 +536,92 @@ update_all() {
 # ============================================================
 # 校验
 # ============================================================
+# 真正的端到端探针：dlopen librknnrt.so 并调一次 rknn_init。
+# 「设备节点在 / 库文件在 / ldd 全解析」都不足以证明 NPU 可用 —— 本次线上故障就是容器里
+# renderD128/129 齐全、ldd 干净，但 librknnrt 打不开 RKNPU 的 card 主节点，
+# 体检却报「NPU 链路校验通过」。
+# 探针脚本宿主与容器共用同一份，保证判据一致。
+# 结论取值：PASS / DEV_FAIL（设备打不开） / MODEL_FAIL（设备通了、模型加载失败）
+#          / NO_LIB / NO_MODEL / NO_SYM / NO_PY，后面带 rknn_init 返回值
+_rknn_probe_script() {
+    cat <<'PY'
+import ctypes, sys
+lib, model = sys.argv[1], sys.argv[2]
+try:
+    rt = ctypes.CDLL(lib)
+except OSError as e:
+    print("NO_LIB %s" % e)
+    sys.exit(0)
+try:
+    buf = open(model, "rb").read()
+except OSError as e:
+    print("NO_MODEL %s" % e)
+    sys.exit(0)
+ctx = ctypes.c_void_p()
+try:
+    r = rt.rknn_init(ctypes.byref(ctx), ctypes.c_char_p(buf), len(buf), 0, 0)
+except Exception as e:
+    print("NO_SYM %s" % e)
+    sys.exit(0)
+if r == 0 and ctx.value:
+    try:
+        rt.rknn_destroy(ctx)
+    except Exception:
+        pass
+print("RET %d" % r)
+PY
+}
+
+# 把 python 的原始输出归类
+_rknn_probe_verdict() {
+    local out="$1" ret
+    ret="$(printf '%s\n' "$out" | grep -oE 'RET +-?[0-9]+' | head -n1 | awk '{print $2}')"
+    if printf '%s' "$out" | grep -q 'NO_LIB'; then printf 'NO_LIB -\n'
+    elif printf '%s' "$out" | grep -q 'NO_MODEL'; then printf 'NO_MODEL -\n'
+    elif printf '%s' "$out" | grep -q 'NO_SYM'; then printf 'NO_SYM -\n'
+    elif printf '%s' "$out" | grep -q 'failed to open rknn device'; then printf 'DEV_FAIL %s\n' "${ret:--}"
+    elif [ "$ret" = "0" ]; then printf 'PASS 0\n'
+    elif [ -z "$ret" ]; then printf 'NO_PY -\n'
+    else printf 'MODEL_FAIL %s\n' "$ret"
+    fi
+    return 0
+}
+
+# 宿主侧：rknn_init_probe <librknnrt.so> <模型>
+rknn_init_probe() {
+    local lib="$1" model="$2" py="${3:-python3}" tmp out
+    if ! command -v "$py" >/dev/null 2>&1; then printf 'NO_PY -\n'; return 0; fi
+    tmp="$(mktemp /tmp/rknn_probe_XXXXXX.py)" || { printf 'NO_PY -\n'; return 0; }
+    _rknn_probe_script > "$tmp"
+    out="$("$py" "$tmp" "$lib" "$model" 2>&1)" || true
+    rm -f "$tmp"
+    _rknn_probe_verdict "$out"
+}
+
+# 容器侧：rknn_init_probe_container <容器内 librknnrt.so> <容器内模型>
+rknn_init_probe_container() {
+    local lib="$1" model="$2" container="${3:-$VIDEO_CONTAINER}" tmp out
+    tmp="$(mktemp /tmp/rknn_probe_XXXXXX.py)" || { printf 'NO_PY -\n'; return 0; }
+    _rknn_probe_script > "$tmp"
+    if ! docker cp "$tmp" "$container:/tmp/rknn_probe.py" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        printf 'NO_PY -\n'
+        return 0
+    fi
+    rm -f "$tmp"
+    out="$(docker exec "$container" python3 /tmp/rknn_probe.py "$lib" "$model" 2>&1)" || true
+    _rknn_probe_verdict "$out"
+}
+
+# 仓库里随便找一颗 .rknn 当探针模型（只读，不会改模型文件）
+rknn_probe_model() {
+    local m
+    for m in "$SCRIPT_DIR"/VIDEO/data/models/*/model.rknn "$SCRIPT_DIR"/RUNTIME/data/models/*/model.rknn; do
+        [ -s "$m" ] && { printf '%s\n' "$m"; return 0; }
+    done
+    return 0
+}
+
 verify_host_side() {
     step "宿主侧"
     local rc=0
@@ -555,9 +641,48 @@ verify_host_side() {
         fi
         grep -E '^\s+- /dev/' "$SCRIPT_DIR/VIDEO/.docker-compose.runtime.override.yaml" \
             | sed 's/^/    设备透传:/' || warn "  override 未包含任何 /dev 节点"
+        # RKNPU 的 card 主节点必须出现，否则容器内一定打不开设备
+        if [ "$(uname -m)" = "aarch64" ]; then
+            local need nd
+            need="$(npu_device_nodes | grep '/dev/dri/card' || true)"
+            for nd in $need; do
+                if grep -qF -- "$nd:$nd" "$SCRIPT_DIR/VIDEO/.docker-compose.runtime.override.yaml"; then
+                    success "  override 已透传 $nd（librknnrt 实际打开的节点）"
+                else
+                    error "  override 缺 $nd：容器内 rknn_init 会报 failed to open rknn device"
+                    error "  重新生成：bash VIDEO/scripts/ensure_runtime_cpp.sh wire，再 $0 restart"
+                    rc=1
+                fi
+            done
+            if [ -z "$need" ]; then
+                warn "  sysfs 里没识别出 RKNPU 的 card 节点（驱动名不匹配？），跳过该项检查"
+            fi
+        fi
     else
         error "  缺少 VIDEO/.docker-compose.runtime.override.yaml（跑 $0 build 生成）"
         rc=1
+    fi
+    # 宿主侧真调一次 rknn_init：设备不通就别指望容器通
+    local hlib hmodel verdict
+    hlib="$(rknn_system_runtime_lib 2>/dev/null || true)"
+    [ -n "$hlib" ] || hlib="$(rknn_runtime_lib 2>/dev/null || true)"
+    hmodel="$(rknn_probe_model)"
+    if [ -n "$hlib" ] && [ -n "$hmodel" ]; then
+        verdict="$(rknn_init_probe "$hlib" "$hmodel")"
+        case "${verdict%% *}" in
+            PASS)   success "  宿主 rknn_init 通过（${verdict}）" ;;
+            DEV_FAIL) error "  宿主 rknn_init 打不开 NPU 设备（${verdict}）：内核 rknpu 驱动未加载"
+                      error "  容器侧不可能通，先修宿主：dmesg | grep -i rknpu"
+                      rc=1 ;;
+            MODEL_FAIL) warn "  宿主能开设备，但加载模型失败（${verdict}）："
+                        warn "    ${hmodel}"
+                        warn "    多半是 librknnrt 版本与模型导出用的 rknn-toolkit2 不匹配，"
+                        warn "    或模型的 target_platform 不是 rk3588。换 SDK/重导出模型。"
+                        rc=1 ;;
+            *)      warn "  宿主 rknn_init 探针未执行（${verdict}）" ;;
+        esac
+    else
+        info "  缺 librknnrt.so 或仓库内无 .rknn 模型，跳过宿主 rknn_init 探针"
     fi
     return "$rc"
 }
@@ -574,10 +699,12 @@ verify_container_side() {
         error "  ${VIDEO_CONTAINER} 未运行（${state}）：先 $0 restart"
         return 1
     fi
-    local rc=0 out
+    local rc=0 out verdict
     out="$(docker exec "$VIDEO_CONTAINER" sh -c '
         echo "-- 设备节点 --"
-        ls /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service /dev/dri/renderD* 2>/dev/null || echo "（无）"
+        ls /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service /dev/dri/renderD* /dev/dri/card* 2>/dev/null || echo "（无）"
+        echo "-- cgroup 设备白名单 --"
+        cat /sys/fs/cgroup/devices/devices.list 2>/dev/null | grep -E "^c (226|10|241)" || true
         echo "-- librknnrt --"
         ls -1 /opt/easyaiot/rknn-lib/librknnrt.so /usr/lib/librknnrt.so 2>/dev/null || echo "（容器内未找到）"
         echo "-- RUNTIME --"
@@ -592,6 +719,31 @@ verify_container_side() {
         && { error "  容器内有未解析的依赖库（见上方 not found）"; rc=1; }
     echo "$out" | grep -Eq '/dev/(rga|rknpu|mpp_service|dri/renderD)' \
         || { error "  容器内没有 NPU/MPP 设备节点：重建容器时确认 override 生效"; rc=1; }
+    # 硬证据：容器里真跑一次 rknn_init。上面的 ls/grep 只能证明「文件在」，
+    # 证明不了设备可访问（缺 card 主节点时 ls 一样是干净的）。
+    local cmodel
+    cmodel="$(docker exec "$VIDEO_CONTAINER" sh -c \
+        'for f in /app/data/models/*/model.rknn; do [ -s "$f" ] && { echo "$f"; exit 0; }; done' 2>/dev/null || true)"
+    if [ -n "$cmodel" ]; then
+        verdict="$(rknn_init_probe_container /opt/easyaiot/rknn-lib/librknnrt.so "$cmodel")"
+        case "${verdict%% *}" in
+            PASS) success "  容器内 rknn_init 通过（${verdict}，模型 ${cmodel}）" ;;
+            DEV_FAIL)
+                error "  容器内 rknn_init 打不开 NPU 设备（${verdict}，模型 ${cmodel}）"
+                error "  九成是缺 RKNPU 的 /dev/dri/card* 主节点：docker 的 devices: 精确到 major:minor，"
+                error "  只透传 renderD* 时容器里 mknod 也打不开（cgroup v1 的 c *:* m 只允许 mknod）。"
+                error "  修法：bash VIDEO/scripts/ensure_runtime_cpp.sh wire && $0 restart"
+                error "  验证：docker exec $VIDEO_CONTAINER cat /sys/fs/cgroup/devices/devices.list | grep 226"
+                rc=1 ;;
+            MODEL_FAIL)
+                warn "  容器内能打开 NPU 设备，但模型加载失败（${verdict}，模型 ${cmodel}）"
+                warn "  与宿主同款问题的话，是 librknnrt 版本 / 模型 target_platform 不匹配，不是容器配置"
+                ;;
+            *)  warn "  容器内 rknn_init 探针未执行（${verdict}）" ;;
+        esac
+    else
+        info "  容器内没有 .rknn 模型，跳过 rknn_init 端到端探针（下发一个 RKNN 算法任务后再 verify）"
+    fi
     return "$rc"
 }
 

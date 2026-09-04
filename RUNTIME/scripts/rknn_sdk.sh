@@ -10,7 +10,7 @@
 #   rknn_runtime_lib     打印运行期 librknnrt.so 路径，找不到返回 1
 #   rknn_system_runtime_lib  只要系统路径（/usr/lib 等）里那份，不含 SDK 目录副本
 #   librknnrt_version    从 librknnrt.so 里取出版本号（比对 SDK 与盒子驱动用）
-#   npu_device_nodes     逐行打印存在的 NPU / RGA / MPP 设备节点
+#   npu_device_nodes     逐行打印存在的 NPU / RGA / MPP 设备节点（含 RKNPU 的 /dev/dri/card*）
 #   npu_core_mask_normalize  把可读别名（all/core0/core0_1...）归一化成 RUNTIME 认得的值
 
 [[ -n "${RUNTIME_RKNN_SDK_LOADED:-}" ]] && return 0
@@ -108,9 +108,28 @@ librknnrt_version() {
 }
 
 # 只列真实存在的节点：docker-compose 的 devices: 写不存在的节点会直接起不来服务
+#
+# /dev/dri 除了 renderD*（MPP/RGA 解码要用）之外，还必须带上 RKNPU 的 card 主节点：
+# RK3588 实测 librknnrt 打开的是 /dev/dri/card1（见 VIDEO/scripts/npu_drm_nodes.sh 的说明），
+# 漏掉它会让容器内 rknn_init 稳定失败在「failed to open rknn device」。
 npu_device_nodes() {
-  local node seen=" "
-  for node in /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service /dev/dri/renderD*; do
+  local helper node seen=" "
+  local -a card_nodes=()
+  for helper in "$(dirname "${BASH_SOURCE[0]}")/../../VIDEO/scripts/npu_drm_nodes.sh" \
+                "$(pwd)/VIDEO/scripts/npu_drm_nodes.sh" \
+                "VIDEO/scripts/npu_drm_nodes.sh"; do
+    if [ -f "$helper" ]; then
+      # shellcheck source=/dev/null
+      . "$helper"
+      while IFS= read -r node; do
+        # 用 if 而不是 `[ -n ] && ...+=`：末次命令返回 1 会触发调用方的 set -e
+        if [ -n "$node" ]; then card_nodes+=("$node"); fi
+      done <<< "$(npu_drm_card_nodes)"
+      break
+    fi
+  done
+  for node in /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service \
+              /dev/dri/renderD* ${card_nodes[@]+"${card_nodes[@]}"}; do
     [[ -e "$node" ]] || continue
     case "$seen" in *" $node "*) continue ;; esac
     seen="${seen}${node} "
