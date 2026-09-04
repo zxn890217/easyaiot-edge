@@ -55,18 +55,55 @@
               :action="state.modelUploadUrl"
               :headers="headers"
               :show-upload-list="false"
-              accept=".pt,.pth,.h5,.onnx"
+              accept=".pt,.pth,.h5,.onnx,.rknn"
               :disabled="state.isView"
-              @change="handleFileUpload"
+              :custom-request="handleModelCustomRequest"
             >
-              <Button type="primary" :disabled="state.isView">
+              <Button type="primary" :loading="state.modelUploading" :disabled="state.isView">
                 {{ state.isView ? '已上传' : '上传模型文件' }}
               </Button>
             </Upload>
             <div v-if="modelRef.filePath" class="form-extra" :title="fileName">
               已上传：{{ fileName }}
             </div>
-            <div class="form-hint">支持 .pt / .onnx；继续训练需使用 .pt 权重</div>
+            <div class="form-hint">支持 .pt / .onnx / .rknn；继续训练需使用 .pt 权重</div>
+          </FormItem>
+
+          <FormItem v-if="isRknnPending" label="NPU 配套文件">
+            <Upload
+              v-if="auxFiles.length > 0 || !modelRef.filePath"
+              :show-upload-list="false"
+              :multiple="true"
+              accept=".names,.json"
+              :before-upload="handleAuxBeforeUpload"
+              :disabled="state.isView"
+            >
+              <Button :disabled="state.isView">选择 model.names / model.rknn.json</Button>
+            </Upload>
+            <div v-if="auxFiles.length > 0" class="form-extra">
+              <span v-for="(f, idx) in auxFiles" :key="f.name" style="margin-right: 12px">
+                {{ f.name }}
+                <a @click="removeAuxFile(idx)">删除</a>
+              </span>
+            </div>
+            <div v-if="modelRef.filePath" style="margin-top: 6px">
+              <Upload
+                :show-upload-list="false"
+                :multiple="true"
+                accept=".names,.json"
+                :before-upload="handleAuxUploadForExisting"
+                :disabled="state.isView"
+              >
+                <Button :loading="state.auxUploading" :disabled="state.isView">补充上传配套文件</Button>
+              </Upload>
+              <div v-if="uploadedAuxNames.length > 0" class="form-extra">
+                已上传配套文件：{{ uploadedAuxNames.join('、') }}
+              </div>
+            </div>
+            <div class="form-hint">
+              RK3588 NPU 推理需上传 x86 转换产物三件套：model.rknn（上方主文件）+
+              model.names、model.rknn.json（此处配套文件，文件名需与主文件同名）
+            </div>
           </FormItem>
 
           <FormItem label="检测类别">
@@ -78,7 +115,7 @@
                 共 {{ state.classNames.length }} 个检测类别
               </div>
               <span v-else class="form-hint">
-                上传 .pt 权重后将自动识别检测类别
+                上传 .pt / .onnx 权重或 .rknn（配套 .names）后将自动识别检测类别
               </span>
             </div>
           </FormItem>
@@ -116,6 +153,8 @@ const state = reactive({
   isEdit: false,
   isView: false,
   editLoading: false,
+  modelUploading: false,
+  auxUploading: false,
   classNames: [] as string[],
 });
 
@@ -124,6 +163,34 @@ const modelRef = reactive({
   filePath: '',
   imageUrl: '',
 });
+
+// .rknn 配套文件（model.names / model.rknn.json）：与主文件一次请求上传，后端存同 prefix 同 stem
+const auxFiles = ref<File[]>([]);
+// 主文件已上传后补传的配套文件展示名（后端按主文件 stem 重命名存库）
+const uploadedAuxNames = ref<string[]>([]);
+// 主文件选了 .rknn 但尚未上传成功时，也要展示配套文件区
+const pendingRknn = ref(false);
+
+function getPathExt(path: string) {
+  const clean = (path || '').split('?')[0].toLowerCase();
+  const dot = clean.lastIndexOf('.');
+  return dot >= 0 ? clean.slice(dot) : '';
+}
+
+const isRknnPending = computed(
+  () => pendingRknn.value || getPathExt(modelRef.filePath) === '.rknn',
+);
+
+function isRknnAuxName(name: string) {
+  const lower = (name || '').toLowerCase();
+  return lower.endsWith('.names') || lower.endsWith('.rknn.json');
+}
+
+function resetAuxState() {
+  auxFiles.value = [];
+  uploadedAuxNames.value = [];
+  pendingRknn.value = false;
+}
 
 const getTitle = computed(() => (state.isEdit ? '编辑模型' : state.isView ? '查看模型' : '新增模型'));
 
@@ -198,6 +265,7 @@ function resetFormState() {
   modelRef.filePath = '';
   modelRef.imageUrl = '';
   state.classNames = [];
+  resetAuxState();
 }
 
 function applyClassNames(classNames: string[]) {
@@ -223,7 +291,11 @@ async function modelEdit(record: any) {
   try {
     state.editLoading = true;
     modelRef.id = record.id ?? null;
-    modelRef.filePath = record.filePath ?? record.model_path ?? '';
+    const rknnPath = record.rknn_model_path || '';
+    // rknn 主模型优先展示（NPU 场景），否则回退 pt/onnx
+    modelRef.filePath =
+      rknnPath || record.filePath || record.model_path || record.onnx_model_path || '';
+    resetAuxState();
     modelRef.imageUrl = record.imageUrl ?? record.image_url ?? '';
     const s = record.status;
     await setFieldsValue({
@@ -246,19 +318,107 @@ function handleCancel() {
   closeDrawer();
 }
 
-function handleFileUpload(info: any) {
-  if (info.file.status === 'done') {
-    const response = info.file.response;
+function handleAuxBeforeUpload(file: File) {
+  const name = (file.name || '').toLowerCase();
+  if (!name.endsWith('.names') && !name.endsWith('.rknn.json')) {
+    createMessage.warning('配套文件仅支持 .names / .rknn.json');
+    return false;
+  }
+  if (!auxFiles.value.some((f) => f.name === file.name)) {
+    auxFiles.value.push(file);
+  }
+  return false;
+}
+
+function removeAuxFile(index: number) {
+  auxFiles.value.splice(index, 1);
+}
+
+// 主文件已上传后补传配套文件：走 /model/upload_aux，后端按主文件 stem 重命名存同 prefix
+function handleAuxUploadForExisting(file: File) {
+  const name = (file.name || '').toLowerCase();
+  if (!isRknnAuxName(name)) {
+    createMessage.warning('配套文件仅支持 .names / .rknn.json');
+    return false;
+  }
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('primary_url', modelRef.filePath);
+  state.auxUploading = true;
+  fetch(state.modelAuxUploadUrl, {
+    method: 'POST',
+    headers: { ...headers.value },
+    body: formData,
+  })
+    .then((resp) => resp.json())
+    .then((response) => {
+      if (response && response.code === 0) {
+        const display = response.data?.fileName || file.name;
+        if (!uploadedAuxNames.value.includes(display)) {
+          uploadedAuxNames.value.push(display);
+        }
+        const classNames = parseModelClassPayload(response.data || {}).classNames;
+        if (classNames.length > 0) {
+          applyClassNames(classNames);
+        }
+        createMessage.success(`配套文件 ${display} 上传成功`);
+      } else {
+        createMessage.error(response?.msg || '配套文件上传失败');
+      }
+    })
+    .catch((error) => {
+      createMessage.error(error?.message || '配套文件上传失败');
+    })
+    .finally(() => {
+      state.auxUploading = false;
+    });
+  return false;
+}
+
+async function handleModelCustomRequest(request: any) {
+  const file: File = request.file;
+  const ext = `.${(file.name || '').split('.').pop()?.toLowerCase() || ''}`;
+  pendingRknn.value = ext === '.rknn';
+  const formData = new FormData();
+  formData.append('file', file);
+  if (ext === '.rknn') {
+    auxFiles.value.forEach((aux) => formData.append('aux_files', aux));
+  }
+  state.modelUploading = true;
+  try {
+    const resp = await fetch(state.modelUploadUrl, {
+      method: 'POST',
+      headers: { ...headers.value },
+      body: formData,
+    });
+    const response = await resp.json();
     if (response && response.code === 0) {
       modelRef.filePath = response.data.url;
       applyClassNames(parseModelClassPayload(response.data).classNames);
-      createMessage.success('模型文件上传成功');
+      if (ext === '.rknn' && response.data.classNames?.length) {
+        createMessage.success('模型文件上传成功（检测类别已从 .names 识别）');
+      } else if (ext === '.rknn' && auxFiles.value.length === 0) {
+        createMessage.warning('模型文件上传成功，但未上传 .names 配套文件，检测类别为空');
+      } else {
+        createMessage.success('模型文件上传成功');
+      }
+      if (ext === '.rknn') {
+        // 配套文件已随主文件一次请求存库，转入"已上传配套"展示
+        uploadedAuxNames.value = auxFiles.value.map((f) => f.name);
+        auxFiles.value = [];
+      } else {
+        resetAuxState();
+      }
+      request.onSuccess?.(response);
     } else {
       createMessage.error(response?.msg || '文件上传失败');
+      request.onError?.(new Error(response?.msg || '文件上传失败'));
     }
-  } else if (info.file.status === 'error') {
-    const response = info.file.response;
-    createMessage.error(response?.msg || info.file.error?.message || '文件上传失败');
+  } catch (error: any) {
+    createMessage.error(error?.message || '文件上传失败');
+    request.onError?.(error);
+  } finally {
+    state.modelUploading = false;
   }
 }
 

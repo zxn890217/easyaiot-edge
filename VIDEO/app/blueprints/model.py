@@ -5,6 +5,7 @@
 """
 import logging
 import os
+import re
 import shutil
 import uuid
 import tempfile
@@ -226,6 +227,119 @@ def upload_model_file():
                 logger.error(f"删除临时文件失败: {temp_path}, 错误: {str(e)}")
 
 
+def _guess_yolo_version_from_filename(filename: str) -> str:
+    """从文件名推断 YOLO 版本（仅用于对象存储分类目录）。
+
+    RKNN 产物在盒子上无法深验（rknn-toolkit2 只跑 x86），版本识别不了时
+    默认 yolov8——与转换脚本 ensure_rknn_model.py 的默认目标一致。
+    """
+    match = re.search(r'yolo\s*v?(\d+)', str(filename or ''), re.IGNORECASE)
+    if match:
+        candidate = f'yolov{match.group(1)}'
+        if candidate in ('yolov8', 'yolov11', 'yolov26'):
+            return candidate
+    return 'yolov8'
+
+
+def _rknn_sanity_check(path: str) -> bool:
+    """轻量校验 .rknn：大小 + 魔数。
+
+    rknn-toolkit2 装不进 aarch64 盒子，无法加载深验；magic 头含
+    'RKNN'（新格式）或 'ttknr'（旧格式/小端变体）即认为文件形态正确。
+    """
+    try:
+        if os.path.getsize(path) < 1024:
+            return False
+        with open(path, 'rb') as f:
+            head = f.read(64)
+        return b'RKNN' in head or b'ttknr' in head
+    except OSError:
+        return False
+
+
+def _rknn_aux_kind(filename: str):
+    """识别 .rknn 配套文件类型：'.names' / '.rknn.json' / None。"""
+    name = os.path.basename(str(filename or '')).lower()
+    if name.endswith('.rknn.json'):
+        return '.rknn.json'
+    if name.endswith('.names'):
+        return '.names'
+    return None
+
+
+def _parse_names_file(path: str):
+    """解析 .names 文本（每行一个类别名）为类别列表。"""
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            return [line.strip() for line in f if line.strip()]
+    except OSError as e:
+        logger.warning(f"读取 .names 文件失败: {path}, {e}")
+        return []
+
+
+def _storage_path_ext(file_path) -> str:
+    """取存储路径/下载URL的真实文件后缀（URL 带 ?prefix= 查询串，需先剥离）。"""
+    path = str(file_path or '').strip()
+    if not path:
+        return ''
+    if '?' in path:
+        path = path.split('?', 1)[0]
+    return os.path.splitext(path)[1].lower()
+
+
+@model_bp.route('/upload_aux', methods=['POST'])
+def upload_rknn_aux():
+    """为已上传的 .rknn 主文件补传配套文件（.names / .rknn.json）。
+
+    前端先传主文件拿到 url，再选配套文件；object key 与主文件同 prefix、
+    且用主文件 stem 命名，保证任务侧 _materialize_export_artifact 能配套下载。
+    """
+    if 'file' not in request.files:
+        return jsonify({'code': 400, 'msg': '未找到文件'}), 400
+
+    file = request.files['file']
+    kind = _rknn_aux_kind(file.filename)
+    if not kind:
+        return jsonify({'code': 400, 'msg': '配套文件仅支持 .names / .rknn.json'}), 400
+
+    primary_url = (request.form.get('primary_url') or '').strip()
+    bucket_name, object_key = resolve_minio_bucket_key(primary_url)
+    if not bucket_name or not object_key or _storage_path_ext(object_key) != '.rknn':
+        return jsonify({'code': 400, 'msg': 'primary_url 必须是已上传的 .rknn 下载URL'}), 400
+
+    temp_dir = 'temp_uploads'
+    os.makedirs(temp_dir, exist_ok=True)
+    stem = os.path.splitext(object_key[object_key.rfind('/') + 1:])[0]
+    aux_name = f"{stem}{kind}"
+    aux_temp = os.path.join(temp_dir, f"{uuid.uuid4().hex}_{aux_name}")
+    try:
+        file.save(aux_temp)
+        new_key = f"{object_key[: object_key.rfind('/') + 1]}{aux_name}"
+        ok, err = ModelService.upload_to_minio(bucket_name, new_key, aux_temp)
+        if not ok:
+            return jsonify({'code': 500, 'msg': f'配套文件上传失败: {err or "未知错误"}'}), 500
+
+        data = {
+            'url': f"/api/v1/buckets/{bucket_name}/objects/download?prefix={new_key}",
+            'fileName': aux_name,
+            'kind': kind,
+        }
+        if kind == '.names':
+            class_names = _parse_names_file(aux_temp)
+            data['class_names'] = class_names
+            data['classNames'] = class_names
+        return jsonify({'code': 0, 'msg': '配套文件上传成功', 'data': data})
+    except Exception as e:
+        logger.error(f"配套文件上传失败: {str(e)}")
+        return jsonify({'code': 500, 'msg': f'服务器内部错误: {str(e)}'}), 500
+    finally:
+        if os.path.exists(aux_temp):
+            try:
+                os.remove(aux_temp)
+            except OSError:
+                pass
+
+
 @model_bp.route('/upload', methods=['POST'])
 def upload_custom_model():
     """
@@ -247,8 +361,8 @@ def upload_custom_model():
 
     # 检查文件扩展名
     ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in ['.pt', '.onnx']:
-        return jsonify({'code': 400, 'msg': '只支持.pt和.onnx格式的YOLO模型文件'}), 400
+    if ext not in ['.pt', '.onnx', '.rknn']:
+        return jsonify({'code': 400, 'msg': '只支持.pt、.onnx和.rknn格式的YOLO模型文件'}), 400
 
     # 获取可选参数
     name = request.form.get('name', '').strip()
@@ -271,7 +385,18 @@ def upload_custom_model():
         yolo_version = None
         detection_method = None
         
-        if ext == '.onnx':
+        if ext == '.rknn':
+            # RKNN 产物由 x86 侧 rknn-toolkit2 转换生成，盒子无 toolkit 无法深验；
+            # 只做魔数/大小轻校验，类别名从配套 .names 解析。
+            if not _rknn_sanity_check(temp_path):
+                return jsonify({
+                    'code': 400,
+                    'msg': '.rknn 文件校验失败：文件过小或不含 RKNN 魔数，请确认上传的是 rknn-toolkit2 转换产物'
+                }), 400
+            yolo_version = _guess_yolo_version_from_filename(file.filename)
+            detection_method = 'rknn'
+            logger.info(f"RKNN模型接受: {file.filename} -> {yolo_version}（配套文件轻校验）")
+        elif ext == '.onnx':
             # 验证ONNX模型
             try:
                 from app.utils.onnx_validator import validate_onnx_model
@@ -353,6 +478,8 @@ def upload_custom_model():
         # 根据文件类型选择不同的存储路径
         if ext == '.onnx':
             object_key = f"yolo/{yolo_version}/onnx/{unique_filename}"
+        elif ext == '.rknn':
+            object_key = f"yolo/{yolo_version}/rknn/{unique_filename}"
         else:
             object_key = f"yolo/{yolo_version}/{unique_filename}"
 
@@ -361,12 +488,52 @@ def upload_custom_model():
             error_msg = upload_error or '文件上传到MinIO失败'
             return jsonify({'code': 500, 'msg': error_msg}), 500
 
+        # .rknn 配套文件（{stem}.names / {stem}.rknn.json）：必须与主文件同 prefix、同 stem，
+        # 任务侧 _materialize_export_artifact 依赖该命名自动配套下载。
+        stem = os.path.splitext(unique_filename)[0]
+        uploaded_aux = []
+        rknn_class_names = None
+        if ext == '.rknn':
+            aux_files = [f for f in request.files.getlist('aux_files') if f and f.filename]
+            aux_by_kind = {}
+            for aux in aux_files:
+                kind = _rknn_aux_kind(aux.filename)
+                if kind and kind not in aux_by_kind:
+                    aux_by_kind[kind] = aux
+            if '.rknn.json' in aux_by_kind and '.names' not in aux_by_kind:
+                return jsonify({
+                    'code': 400,
+                    'msg': '检测到 model.rknn.json 但缺少配套的 model.names，请一并上传转换产物三件套'
+                }), 400
+            prefix = object_key[: object_key.rfind('/') + 1]
+            for kind, aux in aux_by_kind.items():
+                aux_name = f"{stem}{kind}"
+                aux_key = f"{prefix}{aux_name}"
+                aux_temp = os.path.join(temp_dir, aux_name)
+                try:
+                    aux.save(aux_temp)
+                    ok, err = ModelService.upload_to_minio(bucket_name, aux_key, aux_temp)
+                    if not ok:
+                        return jsonify({'code': 500, 'msg': f'配套文件 {aux.filename} 上传失败: {err or "未知错误"}'}), 500
+                    uploaded_aux.append(aux_key)
+                    if kind == '.names':
+                        rknn_class_names = _parse_names_file(aux_temp)
+                finally:
+                    if os.path.exists(aux_temp):
+                        try:
+                            os.remove(aux_temp)
+                        except OSError:
+                            pass
+
         # 生成下载URL
         download_url = f"/api/v1/buckets/{bucket_name}/objects/download?prefix={object_key}"
         minio_path = f"{bucket_name}/{object_key}"
 
-        # 提取模型类别标签
-        class_names = extract_class_names_from_model(temp_path)
+        # 提取模型类别标签（.rknn 从配套 .names 解析，pt/onnx 从模型文件解析）
+        if ext == '.rknn':
+            class_names = rknn_class_names or []
+        else:
+            class_names = extract_class_names_from_model(temp_path)
         selected_class_names = request.form.get('selectedClassNames') or request.form.get('selected_class_names')
         if selected_class_names:
             parsed_selected = parse_class_names_json(selected_class_names)
@@ -386,7 +553,8 @@ def upload_custom_model():
                 'fileName': file.filename,
                 'yolo_version': yolo_version,
                 'detection_method': detection_method,
-                'model_format': 'onnx' if ext == '.onnx' else 'pt',
+                'model_format': 'onnx' if ext == '.onnx' else ('rknn' if ext == '.rknn' else 'pt'),
+                'aux_files': uploaded_aux,
                 'class_names': class_names,
                 'classNames': class_names,
                 'selected_class_names': selected_class_names_list,
@@ -463,12 +631,13 @@ def upload_custom_model():
                 }), 400
 
             try:
-                # 创建模型记录，保存MinIO下载URL到model_path字段
+                # 创建模型记录，保存MinIO下载URL到对应格式字段
                 model = Model(
                     name=name,
                     description=description,
-                    model_path=download_url if ext != '.onnx' else None,  # PT模型保存到model_path
+                    model_path=download_url if ext not in ('.onnx', '.rknn') else None,  # PT模型保存到model_path
                     onnx_model_path=download_url if ext == '.onnx' else None,  # ONNX模型保存到onnx_model_path
+                    rknn_model_path=download_url if ext == '.rknn' else None,  # RKNN模型保存到rknn_model_path
                     version=version,
                     image_url=image_url if image_url else None,
                     class_names=dump_class_names_json(class_names),
@@ -547,11 +716,14 @@ def create_model():
                 'msg': f'模型"{name}"版本"{version}"已存在，请使用其他名称或版本号'
             }), 400
 
-        # 创建模型记录
+        # 创建模型记录；按 filePath 真实后缀路由到对应格式字段（.rknn 写 rknn_model_path）
+        file_ext = _storage_path_ext(file_path)
         model = Model(
             name=name,
             description=description,
-            model_path=file_path,
+            model_path='' if file_ext in ('.onnx', '.rknn') else file_path,
+            onnx_model_path=file_path if file_ext == '.onnx' else None,
+            rknn_model_path=file_path if file_ext == '.rknn' else None,
             image_url=image_url,
             version=version,
             status=status
@@ -627,7 +799,15 @@ def update_model(model_id):
         if 'description' in data:
             model.description = data['description']
         if 'filePath' in data:
-            model.model_path = data['filePath']
+            # 按 filePath 真实后缀路由字段；非 rknn 时清空 rknn_model_path 避免旧值残留
+            file_ext = _storage_path_ext(data['filePath'])
+            model.model_path = '' if file_ext in ('.onnx', '.rknn') else data['filePath']
+            if file_ext == '.onnx':
+                model.onnx_model_path = data['filePath']
+            if file_ext == '.rknn':
+                model.rknn_model_path = data['filePath']
+            else:
+                model.rknn_model_path = None
         if 'imageUrl' in data:
             model.image_url = data['imageUrl']
         if 'status' in data and data['status'] is not None:
@@ -838,7 +1018,7 @@ def resolve_minio_bucket_key(path: str):
 def _iter_model_storage_paths(model: Model):
     """按优先级返回可用于解析类别的模型文件路径（优先 .pt 权重）。"""
     seen = set()
-    for path in (model.model_path, model.onnx_model_path):
+    for path in (model.model_path, model.onnx_model_path, model.rknn_model_path):
         if path and path not in seen:
             seen.add(path)
             yield path
@@ -850,8 +1030,8 @@ def download_model(model_id):
     try:
         model = Model.query.get_or_404(model_id)
         
-        # 优先使用 model_path，如果没有则使用 onnx_model_path
-        model_path = model.model_path or model.onnx_model_path
+        # 优先使用 model_path，其次 onnx，最后 rknn
+        model_path = model.model_path or model.onnx_model_path or model.rknn_model_path
         
         if not model_path:
             return jsonify({
@@ -866,8 +1046,9 @@ def download_model(model_id):
                 'msg': '无法解析模型文件路径'
             }), 400
 
-        # 创建临时文件
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pt')
+        # 创建临时文件（后缀跟随对象真实扩展名，rknn 时落地 model.rknn 同名形态）
+        object_ext = os.path.splitext(object_key)[1].lower() or '.pt'
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=object_ext)
         tmp_file.close()
 
         # 从MinIO下载
@@ -878,8 +1059,8 @@ def download_model(model_id):
                 'msg': error_msg or '从MinIO下载文件失败'
             }), 404 if error_msg and '不存在' in error_msg else 500
 
-        # 确定文件扩展名
-        file_ext = '.onnx' if model.onnx_model_path and not model.model_path else '.pt'
+        # 确定文件扩展名（以对象存储真实后缀为准）
+        file_ext = object_ext
         download_name = f"{model.name}_{model.version or _DEFAULT_MODEL_VERSION}{file_ext}"
 
         # 发送文件

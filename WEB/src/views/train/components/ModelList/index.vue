@@ -182,13 +182,25 @@ const handleDelete = async (record) => {
   }
 };
 
+// 根据后端真实路径推断下载文件扩展名
+const resolveModelFileExt = (record) => {
+  const candidates = [record.model_path, record.onnx_model_path, record.rknn_model_path].filter(Boolean);
+  for (const path of candidates) {
+    const clean = String(path).split('?')[0].toLowerCase();
+    for (const ext of ['.pt', '.onnx', '.rknn']) {
+      if (clean.endsWith(ext)) return ext;
+    }
+  }
+  return '.pt';
+};
+
 // 下载模型处理函数
 const handleDownload = async (record) => {
   try {
     const token = localStorage.getItem('jwt_token');
     
-    // 优先使用后台返回的 model_path 或 onnx_model_path（MinIO 路径）
-    const modelPath = record.model_path || record.onnx_model_path;
+    // 优先使用后台返回的 model_path / onnx_model_path / rknn_model_path（MinIO 路径）
+    const modelPath = record.model_path || record.onnx_model_path || record.rknn_model_path;
     
     let downloadUrl;
     if (modelPath) {
@@ -232,7 +244,7 @@ const handleDownload = async (record) => {
     
     // 从响应头获取文件名，如果没有则根据模型路径确定
     const contentDisposition = response.headers.get('Content-Disposition');
-    let fileName = `${record.name}_${record.version || '1.0.0'}.pt`;
+    let fileName = `${record.name}_${record.version || '1.0.0'}${resolveModelFileExt(record)}`;
     
     if (contentDisposition) {
       const fileNameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
@@ -250,13 +262,11 @@ const handleDownload = async (record) => {
         }
       } catch (e) {
         // 如果解析失败，根据模型类型确定扩展名
-        const fileExt = record.onnx_model_path && !record.model_path ? '.onnx' : '.pt';
-        fileName = `${record.name}_${record.version || '1.0.0'}${fileExt}`;
+        fileName = `${record.name}_${record.version || '1.0.0'}${resolveModelFileExt(record)}`;
       }
     } else {
       // 根据模型路径确定文件扩展名
-      const fileExt = record.onnx_model_path && !record.model_path ? '.onnx' : '.pt';
-      fileName = `${record.name}_${record.version || '1.0.0'}${fileExt}`;
+      fileName = `${record.name}_${record.version || '1.0.0'}${resolveModelFileExt(record)}`;
     }
     
     // 创建下载链接
