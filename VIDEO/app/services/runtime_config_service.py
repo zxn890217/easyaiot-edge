@@ -1795,8 +1795,16 @@ def runtime_library_path_env() -> str:
     ):
         if os.path.isdir(cuda_path):
             parts.append(cuda_path)
-    # librknnrt.so 所在目录（RK3588 固件常见落点），有文件才加，避免污染 x86 环境
-    for lib_dir in (str((_repo_root() / 'RUNTIME' / 'lib')), '/usr/local/lib', '/oem/usr/lib', '/vendor/usr/lib'):
+    # librknnrt.so 所在目录：/opt/easyaiot/rknn-lib 是 override 注入 NPU 库的容器内挂载点，
+    # 其余为 RK3588 固件宿主落点。有文件才加，避免污染 x86 环境。
+    # 不能只靠 existing 透传：守护进程 env 在启动钩子覆盖后可能已丢失该段，导致 127。
+    for lib_dir in (
+        '/opt/easyaiot/rknn-lib',
+        str((_repo_root() / 'RUNTIME' / 'lib')),
+        '/usr/local/lib',
+        '/oem/usr/lib',
+        '/vendor/usr/lib',
+    ):
         if os.path.isfile(os.path.join(lib_dir, 'librknnrt.so')):
             parts.append(lib_dir)
     # dedupe preserve order
