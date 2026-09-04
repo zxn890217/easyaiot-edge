@@ -278,12 +278,19 @@ def _parse_names_file(path: str):
 
 
 def _storage_path_ext(file_path) -> str:
-    """取存储路径/下载URL的真实文件后缀（URL 带 ?prefix= 查询串，需先剥离）。"""
+    """取存储路径/下载URL的真实文件后缀。
+
+    MinIO 下载 URL 形如
+    /api/v1/buckets/models/objects/download?prefix=yolo/yolov8/rknn/model.rknn
+    真实后缀在 prefix 查询串里，直接剥离查询串会把后缀一起丢掉。
+    """
     path = str(file_path or '').strip()
     if not path:
         return ''
     if '?' in path:
-        path = path.split('?', 1)[0]
+        query = urlparse(path).query
+        prefix = (parse_qs(query).get('prefix') or [''])[0]
+        path = prefix if prefix else path.split('?', 1)[0]
     return os.path.splitext(path)[1].lower()
 
 

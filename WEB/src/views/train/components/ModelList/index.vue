@@ -186,7 +186,11 @@ const handleDelete = async (record) => {
 const resolveModelFileExt = (record) => {
   const candidates = [record.model_path, record.onnx_model_path, record.rknn_model_path].filter(Boolean);
   for (const path of candidates) {
-    const clean = String(path).split('?')[0].toLowerCase();
+    // MinIO 下载 URL 的真实后缀在 ?prefix= 里，直接剥查询串会误判成 .pt
+    const url = String(path);
+    const query = url.indexOf('?');
+    const prefix = query >= 0 ? /[?&]prefix=([^&]+)/.exec(url.slice(query))?.[1] : '';
+    const clean = decodeURIComponent(prefix || (query >= 0 ? url.slice(0, query) : url)).toLowerCase();
     for (const ext of ['.pt', '.onnx', '.rknn']) {
       if (clean.endsWith(ext)) return ext;
     }

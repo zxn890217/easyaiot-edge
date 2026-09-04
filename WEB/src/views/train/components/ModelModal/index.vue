@@ -69,40 +69,32 @@
             <div class="form-hint">支持 .pt / .onnx / .rknn；继续训练需使用 .pt 权重</div>
           </FormItem>
 
-          <FormItem v-if="isRknnPending" label="NPU 配套文件">
+          <FormItem v-if="showAuxSection" label="NPU 配套文件">
             <Upload
-              v-if="auxFiles.length > 0 || !modelRef.filePath"
               :show-upload-list="false"
               :multiple="true"
               accept=".names,.json"
               :before-upload="handleAuxBeforeUpload"
-              :disabled="state.isView"
+              :disabled="state.isView || state.modelUploading"
             >
-              <Button :disabled="state.isView">选择 model.names / model.rknn.json</Button>
+              <Button :loading="state.auxUploading" :disabled="state.isView || state.modelUploading">
+                选择 model.names / model.rknn.json
+              </Button>
             </Upload>
             <div v-if="auxFiles.length > 0" class="form-extra">
+              待随模型文件一并上传：
               <span v-for="(f, idx) in auxFiles" :key="f.name" style="margin-right: 12px">
                 {{ f.name }}
                 <a @click="removeAuxFile(idx)">删除</a>
               </span>
             </div>
-            <div v-if="modelRef.filePath" style="margin-top: 6px">
-              <Upload
-                :show-upload-list="false"
-                :multiple="true"
-                accept=".names,.json"
-                :before-upload="handleAuxUploadForExisting"
-                :disabled="state.isView"
-              >
-                <Button :loading="state.auxUploading" :disabled="state.isView">补充上传配套文件</Button>
-              </Upload>
-              <div v-if="uploadedAuxNames.length > 0" class="form-extra">
-                已上传配套文件：{{ uploadedAuxNames.join('、') }}
-              </div>
+            <div v-if="uploadedAuxNames.length > 0" class="form-extra">
+              已上传配套文件：{{ uploadedAuxNames.join('、') }}
             </div>
             <div class="form-hint">
               RK3588 NPU 推理需上传 x86 转换产物三件套：model.rknn（上方主文件）+
-              model.names、model.rknn.json（此处配套文件，文件名需与主文件同名）
+              model.names、model.rknn.json（此处配套文件，文件名需与主文件同名）。<br />
+              未上传模型文件时，在此选好的配套文件会随主文件一次上传；模型文件已在库中（如编辑模型）时，选定即直接补传。
             </div>
           </FormItem>
 
@@ -171,16 +163,32 @@ const auxFiles = ref<File[]>([]);
 const uploadedAuxNames = ref<string[]>([]);
 // 主文件选了 .rknn 但尚未上传成功时，也要展示配套文件区
 const pendingRknn = ref(false);
+// 直接补传配套文件的并发计数（多选一次会触发多个 before-upload）
+let auxPending = 0;
 
-function getPathExt(path: string) {
-  const clean = (path || '').split('?')[0].toLowerCase();
-  const dot = clean.lastIndexOf('.');
-  return dot >= 0 ? clean.slice(dot) : '';
+// 取存储路径/下载URL 里的真实对象路径：MinIO 下载 URL 的后缀在 ?prefix= 查询串里，
+// 直接剥查询串会把 .rknn 一起丢掉（导致编辑模型时识别不出 NPU 模型）
+function getObjectPath(path: string) {
+  const clean = path || '';
+  const query = clean.indexOf('?');
+  const prefix = query >= 0 ? /[?&]prefix=([^&]+)/.exec(clean.slice(query))?.[1] : '';
+  if (prefix) return decodeURIComponent(prefix);
+  return query >= 0 ? clean.slice(0, query) : clean;
 }
 
+function getPathExt(path: string) {
+  const target = getObjectPath(path).toLowerCase();
+  const dot = target.lastIndexOf('.');
+  return dot >= 0 ? target.slice(dot) : '';
+}
+
+// 主文件是否为 .rknn（含本次待上传），决定配套文件区是否可用
 const isRknnPending = computed(
   () => pendingRknn.value || getPathExt(modelRef.filePath) === '.rknn',
 );
+// 配套文件必须在主文件上传前就能选（FormData 在上传发起时即固定），故新增/编辑态常显；
+// 查看态只在模型确为 .rknn 时展示。
+const showAuxSection = computed(() => !state.isView || isRknnPending.value);
 
 function isRknnAuxName(name: string) {
   const lower = (name || '').toLowerCase();
@@ -198,7 +206,7 @@ const getTitle = computed(() => (state.isEdit ? '编辑模型' : state.isView ? 
 const fileName = computed(() => {
   const path = modelRef.filePath || '';
   if (!path) return '';
-  return path.split('/').pop()?.split('?')[0] || path;
+  return getObjectPath(path).split('/').pop() || path;
 });
 
 const emits = defineEmits(['success', 'register']);
@@ -320,11 +328,29 @@ function handleCancel() {
 }
 
 function handleAuxBeforeUpload(file: File) {
-  const name = (file.name || '').toLowerCase();
-  if (!name.endsWith('.names') && !name.endsWith('.rknn.json')) {
+  if (!isRknnAuxName(file.name || '')) {
     createMessage.warning('配套文件仅支持 .names / .rknn.json');
     return false;
   }
+  // 主文件已在库中（编辑模型，或本次已上传过）：立即补传到该主文件的同 prefix、同 stem
+  if (modelRef.filePath) {
+    if (getPathExt(modelRef.filePath) !== '.rknn') {
+      createMessage.warning('仅 .rknn 模型需要配套文件');
+      return false;
+    }
+    auxPending += 1;
+    state.auxUploading = true;
+    postAuxFile(file, modelRef.filePath)
+      .catch((error) => {
+        createMessage.error(error?.message || '配套文件上传失败');
+      })
+      .finally(() => {
+        auxPending -= 1;
+        state.auxUploading = auxPending > 0;
+      });
+    return false;
+  }
+  // 主文件还没上传：先排队，随下一次 .rknn 上传一并提交
   if (!auxFiles.value.some((f) => f.name === file.name)) {
     auxFiles.value.push(file);
   }
@@ -335,18 +361,12 @@ function removeAuxFile(index: number) {
   auxFiles.value.splice(index, 1);
 }
 
-// 主文件已上传后补传配套文件：走 /model/upload_aux，后端按主文件 stem 重命名存同 prefix
-function handleAuxUploadForExisting(file: File) {
-  const name = (file.name || '').toLowerCase();
-  if (!isRknnAuxName(name)) {
-    createMessage.warning('配套文件仅支持 .names / .rknn.json');
-    return false;
-  }
+// 补传单个配套文件：走 /model/upload_aux，后端按主文件 stem 重命名存同 prefix
+function postAuxFile(file: File, primaryUrl: string): Promise<void> {
   const formData = new FormData();
   formData.append('file', file);
-  formData.append('primary_url', modelRef.filePath);
-  state.auxUploading = true;
-  fetch(state.modelAuxUploadUrl, {
+  formData.append('primary_url', primaryUrl);
+  return fetch(state.modelAuxUploadUrl, {
     method: 'POST',
     headers: { ...headers.value },
     body: formData,
@@ -366,25 +386,18 @@ function handleAuxUploadForExisting(file: File) {
       } else {
         createMessage.error(response?.msg || '配套文件上传失败');
       }
-    })
-    .catch((error) => {
-      createMessage.error(error?.message || '配套文件上传失败');
-    })
-    .finally(() => {
-      state.auxUploading = false;
     });
-  return false;
 }
 
 async function handleModelCustomRequest(request: any) {
   const file: File = request.file;
   const ext = `.${(file.name || '').split('.').pop()?.toLowerCase() || ''}`;
   pendingRknn.value = ext === '.rknn';
+  // FormData 在发起请求时即固定：此刻已在列表里的配套文件才会随主文件一起上传
+  const auxInRequest = ext === '.rknn' ? [...auxFiles.value] : [];
   const formData = new FormData();
   formData.append('file', file);
-  if (ext === '.rknn') {
-    auxFiles.value.forEach((aux) => formData.append('aux_files', aux));
-  }
+  auxInRequest.forEach((aux) => formData.append('aux_files', aux));
   state.modelUploading = true;
   try {
     const resp = await fetch(state.modelUploadUrl, {
@@ -396,19 +409,33 @@ async function handleModelCustomRequest(request: any) {
     if (response && response.code === 0) {
       modelRef.filePath = response.data.url;
       applyClassNames(parseModelClassPayload(response.data).classNames);
-      if (ext === '.rknn' && response.data.classNames?.length) {
-        createMessage.success('模型文件上传成功（检测类别已从 .names 识别）');
-      } else if (ext === '.rknn' && auxFiles.value.length === 0) {
-        createMessage.warning('模型文件上传成功，但未上传 .names 配套文件，检测类别为空');
-      } else {
-        createMessage.success('模型文件上传成功');
-      }
       if (ext === '.rknn') {
-        // 配套文件已随主文件一次请求存库，转入"已上传配套"展示
-        uploadedAuxNames.value = auxFiles.value.map((f) => f.name);
+        uploadedAuxNames.value = auxInRequest.map((f) => f.name);
+        // 上传过程中才选上的配套文件已赶不上本次请求，自动补传到同一 stem，避免静默丢失
+        const lateAux = auxFiles.value.filter((f) => !auxInRequest.includes(f));
         auxFiles.value = [];
+        if (lateAux.length > 0) {
+          await Promise.allSettled(
+            lateAux.map((f) =>
+              postAuxFile(f, response.data.url).catch((error) => {
+                createMessage.error(error?.message || '配套文件上传失败');
+              }),
+            ),
+          );
+        }
+        if (state.classNames.length > 0) {
+          createMessage.success('模型文件上传成功（检测类别已从 .names 识别）');
+        } else {
+          createMessage.warning(
+            '模型文件上传成功，但缺少 .names 配套文件，检测类别为空；请在「NPU 配套文件」里选择与主文件同名的 model.names',
+          );
+        }
       } else {
+        if (auxFiles.value.length > 0) {
+          createMessage.warning('仅 .rknn 模型需要配套文件，已忽略所选配套文件');
+        }
         resetAuxState();
+        createMessage.success('模型文件上传成功');
       }
       request.onSuccess?.(response);
     } else {
