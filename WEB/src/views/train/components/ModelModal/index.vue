@@ -149,6 +149,7 @@ const { uploadUrl } = useGlobSetting();
 
 const state = reactive({
   modelUploadUrl: `${uploadUrl}/model/upload`,
+  modelAuxUploadUrl: `${uploadUrl}/model/upload_aux`,
   imageUploadUrl: `${uploadUrl}/model/image_upload`,
   isEdit: false,
   isView: false,
