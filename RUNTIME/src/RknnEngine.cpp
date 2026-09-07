@@ -299,12 +299,48 @@ int RknnEngine::LoadModel(const std::string& model_path,
             modelLayout_ = "detect";
         }
 
-        if (!model_class.empty()) {
-            yolocore::applyClasses(model_class);
-            LOG(INFO) << "[RKNN] Using " << model_class.size() << " classes from names file";
-        } else {
-            const std::vector<std::string> names = yolocore::readNamesSidecar(rknn_path);
+        // Class table: the ini's classes_path is only a hint. A stale one (e.g. COCO-80
+        // attached to a 4-class model) mislabels every detection without any error, so
+        // reject it when it cannot possibly match the model output width.
+        std::vector<std::string> names = model_class;
+        bool from_classes_path = !names.empty();
+        int64_t expected_classes = 0;
+        if (!end2end_ && impl_->outputAttrs.size() == 1 && impl_->hasOutputShape
+            && impl_->outDims.size() == 2) {
+            const int64_t channels = std::min(impl_->outDims[0], impl_->outDims[1]);
+            if (channels > 4) {
+                expected_classes = channels - 4;  // cv2 head: [4 + nc, anchors]
+            }
+        }
+        if (!names.empty() && expected_classes > 0
+            && static_cast<int64_t>(names.size()) > expected_classes) {
+            LOG(WARNING) << "[RKNN] classes_path lists " << names.size() << " classes but "
+                         << impl_->outDims[0] << "x" << impl_->outDims[1]
+                         << " fits at most " << expected_classes
+                         << " - ignoring classes_path";
+            names.clear();
+            from_classes_path = false;
+        }
+        if (names.empty()) {
+            names = yolocore::readNamesSidecar(rknn_path);  // <model>.names next to the .rknn
+            from_classes_path = false;
+        }
+
+        if (!names.empty()) {
             yolocore::applyClasses(names);
+            LOG(INFO) << "[RKNN] Using " << names.size() << " classes from "
+                      << (from_classes_path ? "classes_path"
+                                            : yolocore::replaceExt(rknn_path, ".names"));
+        } else {
+            // applyClasses() ignores an empty vector, which would leave whatever table a
+            // previously loaded engine installed; synthesize placeholders instead.
+            std::vector<std::string> synthetic;
+            for (int64_t i = 0; i < expected_classes; ++i) {
+                synthetic.push_back("class_" + std::to_string(i));
+            }
+            yolocore::applyClasses(synthetic);
+            LOG(WARNING) << "[RKNN] No usable class names for " << rknn_path << " ("
+                         << expected_classes << " classes) - labels will be class_N";
         }
 
         inferEp_ = "rknn";

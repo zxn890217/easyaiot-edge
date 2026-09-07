@@ -621,15 +621,112 @@ def _export_pt_to_onnx(pt_path: Path, onnx_path: Path, *, force: bool = False) -
     return onnx_path if onnx_path.is_file() else None
 
 
-def _pick_names(onnx_path: Path, fallback: Path) -> str:
-    sibling = onnx_path.with_suffix('.names')
+def _read_names_file(path: Path) -> List[str]:
+    """读取一行一个标签的 .names 文件。"""
+    try:
+        return [line.strip() for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
+    except Exception as exc:  # noqa: BLE001 - 类表缺失不应阻断下发
+        logger.debug('skip names file %s: %s', path, exc)
+        return []
+
+
+def _names_from_sidecar(weight_path: Path) -> List[str]:
+    """从同目录的 .rknn.json 导出描述里取类别名（外部导出工具把 labels 写在这里）。"""
+    candidates: List[Path] = [weight_path.with_suffix('.rknn.json')]
+    if weight_path.parent.is_dir():
+        candidates.extend(sorted(weight_path.parent.glob('*.rknn.json')))
+    for sidecar in candidates:
+        if not sidecar.is_file():
+            continue
+        try:
+            data = json.loads(sidecar.read_text(encoding='utf-8'))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug('skip sidecar %s: %s', sidecar, exc)
+            continue
+        if not isinstance(data, dict):
+            continue
+        for key in ('labels', 'names', 'classes'):
+            raw = data.get(key)
+            if not isinstance(raw, list):
+                continue
+            names = [str(item).strip() for item in raw if str(item).strip()]
+            if names:
+                logger.info('类别表取自 %s 的 %s 字段（%d 类）', sidecar.name, key, len(names))
+                return names
+    return []
+
+
+def _names_from_db(model_id: Optional[int]) -> List[str]:
+    """AiModel.class_names 是控制面上传/导出时回填的完整类表（按 class id 排序）。
+
+    注意不要使用 selected_class_names——那是用户勾选的检测子集，下标与模型输出不对应。
+    """
+    if model_id is None:
+        return []
+    try:
+        from models import AiModel
+        from app.utils.model_class_utils import parse_class_names_json
+
+        row = AiModel.query.get(model_id)
+    except Exception as exc:  # noqa: BLE001 - 无 app context / 表不存在时静默跳过
+        logger.debug('class_names lookup skipped: %s', exc)
+        return []
+    if row is None:
+        return []
+    names = parse_class_names_json(getattr(row, 'class_names', None))
+    if names:
+        logger.info('类别表取自 AiModel(%s).class_names（%d 类）', model_id, len(names))
+    return names
+
+
+def _write_names_file(dest: Path, names: List[str]) -> bool:
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text('\n'.join(names) + '\n', encoding='utf-8')
+        logger.info('已生成类别表 %s（%d 类）', dest, len(names))
+        return True
+    except OSError as exc:
+        logger.warning('写入类别表 %s 失败: %s', dest, exc)
+        return False
+
+
+def _pick_names(weight_path: Path, fallback: Path, model_id: Optional[int] = None) -> str:
+    """为权重挑选 .names。
+
+    顺序：同名 .names → 同目录任意 .names → 同目录 .rknn.json 的 labels/names/classes
+    → AiModel.class_names；后三者命中时写出同名 .names 固化，保证 RUNTIME 拿到与权重同名的类表。
+    全部落空才退回 coco 通用表——80 类标签贴到非 80 类模型上不会报错，只会静默贴错，
+    因此这里必须显式告警。
+    """
+    sibling = weight_path.with_suffix('.names')
     if sibling.is_file():
         return str(sibling)
-    if fallback.is_file():
-        return str(fallback)
-    remote = Path('/opt/easyaiot/RUNTIME/models/coco.names')
-    if remote.is_file():
-        return str(remote)
+
+    names: List[str] = []
+    if weight_path.parent.is_dir():
+        for candidate in sorted(weight_path.parent.glob('*.names')):
+            # 通用表（coco.names）不算模型自带类表，否则会给内置模型复制一份 80 类
+            if candidate.name.lower() == 'coco.names':
+                continue
+            names = _read_names_file(candidate)
+            if names:
+                break
+    if not names:
+        names = _names_from_sidecar(weight_path)
+    if not names:
+        names = _names_from_db(model_id)
+    if names and _write_names_file(sibling, names):
+        return str(sibling)
+
+    for cand in (fallback, Path('/opt/easyaiot/RUNTIME/models/coco.names')):
+        if cand.is_file():
+            coco = _read_names_file(cand)
+            logger.warning(
+                '模型 %s 缺少类别表，退回通用表 %s（%d 类）——若模型类别数与此不符，检测结果标签会贴错；'
+                '请在 %s 放置同名 .names，或让控制面回填 AiModel.class_names',
+                weight_path, cand, len(coco), weight_path.with_suffix('.names'),
+            )
+            return str(cand)
     return str(fallback)
 
 
@@ -689,19 +786,19 @@ def _resolve_custom_model_dir(model_id: int, prefer_cluster: bool) -> Optional[P
     return candidates[0] if candidates else None
 
 
-def _resolve_dir_to_onnx(model_dir: Path, default_names: Path) -> Optional[Tuple[str, str]]:
+def _resolve_dir_to_onnx(model_dir: Path, default_names: Path, model_id: Optional[int] = None) -> Optional[Tuple[str, str]]:
     if not model_dir.is_dir():
         # Still allow canonical remote path for Agent nodes
         canonical = model_dir / 'model.onnx'
-        return str(canonical), _pick_names(canonical, default_names)
+        return str(canonical), _pick_names(canonical, default_names, model_id)
 
     onnx_matches = sorted(model_dir.glob('*.onnx')) + sorted(model_dir.glob('*.ONNX'))
     # Prefer model.onnx
     preferred = [p for p in onnx_matches if p.name.lower() == 'model.onnx']
     if preferred:
-        return str(preferred[0]), _pick_names(preferred[0], default_names)
+        return str(preferred[0]), _pick_names(preferred[0], default_names, model_id)
     if onnx_matches:
-        return str(onnx_matches[0]), _pick_names(onnx_matches[0], default_names)
+        return str(onnx_matches[0]), _pick_names(onnx_matches[0], default_names, model_id)
 
     pt_matches = sorted(model_dir.glob('*.pt')) + sorted(model_dir.glob('*.PT'))
     preferred_pt = [p for p in pt_matches if p.name.lower() in ('model.pt', 'best.pt', 'weights.pt')]
@@ -711,7 +808,7 @@ def _resolve_dir_to_onnx(model_dir: Path, default_names: Path) -> Optional[Tuple
     onnx_out = model_dir / 'model.onnx'
     exported = _export_pt_to_onnx(pt, onnx_out)
     if exported and exported.is_file():
-        return str(exported), _pick_names(exported, default_names)
+        return str(exported), _pick_names(exported, default_names, model_id)
     return None
 
 
@@ -784,11 +881,14 @@ def _resolve_dir_to_rknn(model_id: int, model_dir: Path, default_names: Path) ->
         if matches:
             preferred = [p for p in matches if p.name.lower() == 'model.rknn']
             chosen = (preferred or matches)[0]
-            return str(chosen), _pick_names(chosen, default_names)
+            if not chosen.with_suffix('.names').is_file():
+                # 权重是历史遗留/手工拷入的，伴生的 .names 与 .rknn.json 还没落地——补一次
+                _materialize_export_artifact(model_id, model_dir, 'rknn_model_path')
+            return str(chosen), _pick_names(chosen, default_names, model_id)
 
     materialized = _materialize_export_artifact(model_id, model_dir, 'rknn_model_path')
     if materialized is not None:
-        return str(materialized), _pick_names(materialized, default_names)
+        return str(materialized), _pick_names(materialized, default_names, model_id)
     return None
 
 
@@ -915,12 +1015,12 @@ def _resolve_model_paths(task: AlgorithmTask, prefer_cluster: bool = False) -> T
                 if found:
                     found_p = Path(found)
                     if found_p.suffix.lower() == '.onnx' and found_p.is_file():
-                        return str(found_p), _pick_names(found_p, default_names)
+                        return str(found_p), _pick_names(found_p, default_names, mid_int)
                     if found_p.suffix.lower() == '.pt' and found_p.is_file():
                         onnx_out = found_p.with_suffix('.onnx')
                         exported = _export_pt_to_onnx(found_p, onnx_out)
                         if exported and exported.is_file():
-                            return str(exported), _pick_names(exported, default_names)
+                            return str(exported), _pick_names(exported, default_names, mid_int)
             except Exception as e:
                 logger.debug('cluster file resolve skip: %s', e)
 
@@ -932,7 +1032,7 @@ def _resolve_model_paths(task: AlgorithmTask, prefer_cluster: bool = False) -> T
                 rknn = _resolve_dir_to_rknn(mid_int, model_dir, default_names)
                 if rknn:
                     return rknn
-            resolved = _resolve_dir_to_onnx(model_dir, default_names)
+            resolved = _resolve_dir_to_onnx(model_dir, default_names, mid_int)
             if resolved:
                 # _resolve_dir_to_onnx 在目录缺失时会返回规范路径 model.onnx，
                 # 对集群 Agent 节点可保留（远程节点已存在），但本机 write_local 模式
@@ -940,7 +1040,7 @@ def _resolve_model_paths(task: AlgorithmTask, prefer_cluster: bool = False) -> T
                 # 经 local-storage 懒加载权重到 model_dir/，再走正常 .pt → .onnx 导出。
                 if not os.path.isfile(resolved[0]):
                     if _materialize_db_model(mid_int, model_dir):
-                        re_resolved = _resolve_dir_to_onnx(model_dir, default_names)
+                        re_resolved = _resolve_dir_to_onnx(model_dir, default_names, mid_int)
                         if re_resolved:
                             resolved = re_resolved
                 return resolved
