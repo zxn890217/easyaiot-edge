@@ -56,6 +56,10 @@ bool isEndToEndShape(const std::vector<int64_t>& dims);
  * @param data     row-major float output (already dequantized by the backend)
  * @param dims     output shape ([1, 4+C, N] / [1, N, 4+C] / [1, N, 6])
  * @param end2End  force end-to-end parsing; when false it is derived from `dims`
+ * @param coordScale  factor applied to box cols[0..3] before the letterbox rescale.
+ *              1.0 when the graph emits pixel-space xywh; the input side (e.g. 640)
+ *              when a `_NormalizeCoords` node made them 0..1 (RKNN detect heads).
+ *              Only the detect layout uses it; end2end rows are already pixel xyxy.
  */
 int postprocess(const float* data,
                 const std::vector<int64_t>& dims,
@@ -65,7 +69,8 @@ int postprocess(const float* data,
                 float scoreThreshold,
                 float nmsThreshold,
                 const std::string& logTag,
-                std::vector<DetectObject>& detections);
+                std::vector<DetectObject>& detections,
+                float coordScale = 1.0f);
 
 }  // namespace yolocore
 

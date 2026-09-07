@@ -42,6 +42,11 @@ private:
     bool end2end_{false};
     int input_side_{0};
     int input_channels_{3};
+    /** Factor applied to box cols[0..3] before the letterbox rescale: 1.0 for
+     *  pixel-space xywh outputs, input_side when the graph emits normalized 0..1
+     *  coords (sidecar flag postprocess.coord_normalized, from ultralytics'
+     *  `_NormalizeCoords` node). */
+    float coordScale_{1.0f};
     std::string inferEp_{"none"};
     std::string modelLayout_{"unknown"};
     std::string loadedModelPath_;

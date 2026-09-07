@@ -297,6 +297,24 @@ int RknnEngine::LoadModel(const std::string& model_path,
             }
         } else {
             modelLayout_ = "detect";
+            // ultralytics' rknn exporter can bake a `_NormalizeCoords` node into the
+            // graph, emitting cx,cy,w,h divided by the input side instead of pixel
+            // space. The board decoder assumes pixel-space xywh, so scale them back.
+            // Authoritative source is the sidecar flag; a wrong guess here only
+            // misplaces boxes, never hides them (score is untouched).
+            coordScale_ = 1.0f;
+            bool coordNormalized = false;
+            if (sidecar.isMember("postprocess")
+                && sidecar["postprocess"].isMember("coord_normalized")) {
+                coordNormalized = sidecar["postprocess"]["coord_normalized"].asBool();
+            } else {
+                coordNormalized = sidecar.get("coord_normalized", false).asBool();
+            }
+            if (coordNormalized) {
+                coordScale_ = static_cast<float>(input_side_);
+                LOG(INFO) << "[RKNN] sidecar coord_normalized=true - scaling box "
+                             "coords by input side " << input_side_;
+            }
         }
 
         // Class table: the ini's classes_path is only a hint. A stale one (e.g. COCO-80
@@ -416,7 +434,7 @@ int RknnEngine::Run(cv::Mat& image, std::vector<DetectObject>& detections) {
     std::vector<int64_t> dims = impl_->hasOutputShape ? impl_->outDims : dimsOf(impl_->outputAttrs[0]);
     const int rc = yolocore::postprocess(static_cast<const float*>(outputs[0].buf), dims, end2end_,
                                          x_factor, y_factor, scoreThreshold_, nmsThreshold_, "RKNN",
-                                         detections);
+                                         detections, coordScale_);
 
     rknn_outputs_release(impl_->ctx, static_cast<uint32_t>(outputs.size()), outputs.data());
 

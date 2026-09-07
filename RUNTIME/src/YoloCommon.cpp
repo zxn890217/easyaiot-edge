@@ -203,7 +203,8 @@ int postprocess(const float* data,
                 float scoreThreshold,
                 float nmsThreshold,
                 const std::string& logTag,
-                std::vector<DetectObject>& detections) {
+                std::vector<DetectObject>& detections,
+                float coordScale) {
     detections.clear();
     if (!data) {
         LOG(ERROR) << "[" << logTag << "] null output tensor";
@@ -276,10 +277,13 @@ int postprocess(const float* data,
         double score = 0.0;
         cv::minMaxLoc(classes_scores, nullptr, &score, nullptr, &classIdPoint);
         if (score > scoreThreshold) {
-            const float cx = det_output.at<float>(i, 0);
-            const float cy = det_output.at<float>(i, 1);
-            const float ow = det_output.at<float>(i, 2);
-            const float oh = det_output.at<float>(i, 3);
+            // cols[0..3] are xywh in the model input's pixel space. Some exporters
+            // (ultralytics rknn `_NormalizeCoords`) emit them divided by the input
+            // side; coordScale undoes that before the letterbox rescale below.
+            const float cx = det_output.at<float>(i, 0) * coordScale;
+            const float cy = det_output.at<float>(i, 1) * coordScale;
+            const float ow = det_output.at<float>(i, 2) * coordScale;
+            const float oh = det_output.at<float>(i, 3) * coordScale;
             cv::Rect box;
             box.x = static_cast<int>((cx - 0.5f * ow) * xFactor);
             box.y = static_cast<int>((cy - 0.5f * oh) * yFactor);
