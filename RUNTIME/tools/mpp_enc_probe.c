@@ -57,9 +57,11 @@ static void dumpMppVersion(void) {
 // mpp_init() on a coding value this build does not know returns non-zero and
 // MPP prints "<soc> unsupported"; a supported value returns 0. That is exactly
 // the signal we are after, so the noise is welcome.
+// This MPP vintage renamed the API handle struct: it is `MppApi` (rk_mpi.h:231
+// declares `mpp_create(MppCtx *ctx, MppApi **mpi)`), not the legacy `MpiApi`.
 static int tryCtx(MppCtxType type, MppCodingType coding, const char *label) {
     MppCtx ctx = NULL;
-    MpiApi mpi = NULL;
+    MppApi *mpi = NULL;
 
     int ret = mpp_create(&ctx, &mpi);
     if (ret) {
@@ -73,21 +75,33 @@ static int tryCtx(MppCtxType type, MppCodingType coding, const char *label) {
     fflush(stdout);
 
     if (ret == 0 && type == MPP_CTX_ENC && mpi) {
-        // The header call is the real proof of life: it walks the VEPU driver
+        // GET_HDR_SYNC is the real proof of life: it walks the VEPU driver
         // object and serialises SPS/PPS. A factory stub would fail here even if
         // mpp_init somehow succeeded.
+        //
+        // Only the length is printed unconditionally - this MPP vintage has no
+        // mpp_packet_get_addr(), and we do not want a missing accessor to cost
+        // us the primary verdict. Define MPP_ENC_PROBE_DUMP to also walk the
+        // MppBuffer attached to the packet and hexdump the head bytes.
         MppPacket pkt = NULL;
         int hret = mpi->control(ctx, MPP_ENC_GET_HDR_SYNC, &pkt);
         if (hret || !pkt) {
             printf("[%-28s] GET_HDR_SYNC rc=%d pkt=%p\n", label, hret, (void *)pkt);
         } else {
             size_t len = mpp_packet_get_length(pkt);
-            unsigned char *dat = (unsigned char *)mpp_packet_get_addr(pkt);
-            printf("[%-28s] header bytes=%zu  first=", label, len);
-            for (size_t i = 0; i < len && i < 8; ++i) {
-                printf(" %02x", dat[i]);
+            printf("[%-28s] header bytes=%zu %s\n", label, len,
+                   len > 8 ? "<== real SPS/PPS" : "<== suspiciously short");
+#ifdef MPP_ENC_PROBE_DUMP
+            MppBuffer buf = mpp_packet_get_buffer(pkt);
+            unsigned char *dat = buf ? (unsigned char *)mpp_buffer_get_ptr(buf) : NULL;
+            if (dat) {
+                printf("    head:");
+                for (size_t i = 0; i < len && i < 16; ++i) {
+                    printf(" %02x", dat[i]);
+                }
+                printf("   (expect 00 00 00 01)\n");
             }
-            printf("   (expect 00 00 00 01)\n");
+#endif
             mpp_packet_deinit(&pkt);
         }
         fflush(stdout);
@@ -131,7 +145,7 @@ int main(int argc, char **argv) {
            (int)MPP_VIDEO_CodingAVC);
     for (int c = (int)MPP_VIDEO_CodingAVC - 4; c <= (int)MPP_VIDEO_CodingAVC + 8; ++c) {
         MppCtx ctx = NULL;
-        MpiApi mpi = NULL;
+        MppApi *mpi = NULL;
         if (mpp_create(&ctx, &mpi) || !ctx) {
             continue;
         }
