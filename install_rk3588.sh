@@ -1134,10 +1134,36 @@ verify_container_side() {
     echo "$out" | grep -Eq '/dev/(rga|rknpu|mpp_service|dri/renderD)' \
         || { error "  容器内没有 NPU/MPP 设备节点：重建容器时确认 override 生效"; rc=1; }
     if echo "$out" | grep -q 'DTREE_MISSING'; then
-        error "  容器内读不到设备树 —— MPP 认不出 SoC，rkvdec/VEPU 的平台匹配会失败"
-        error "  wire 时会自动把 /sys/firmware/devicetree/base 只读挂进容器；还报就说明"
-        error "  override 没生效：docker inspect $VIDEO_CONTAINER | grep -A8 Binds"
-        rc=1
+        error "  容器内读不到设备树 —— MPP 认不出 SoC，rkvdec/VEPU 的平台匹配会失败"; rc=1
+        # 三级取证：宿主有没有 → 生成的 override 里有没有 → 跑着的容器挂上没挂上。
+        # 缺哪一级就停在哪儿：探测失败 / wire 没重跑 / 容器没重建。
+        local dt_ovr="$SCRIPT_DIR/VIDEO/.docker-compose.runtime.override.yaml"
+        # 宿主上这两条要分开看：MPP 读的是 /proc/device-tree（内核 procfs 建的符号链接），
+        # wire 探测的是 /sys/firmware/devicetree/base（真实目录）。前者不通说明内核没编
+        # CONFIG_PROC_DEVICETREE —— 挂设备树也救不了，宿主上 MPP 同样认不出 SoC。
+        if [ -r /proc/device-tree/compatible ]; then
+            info "  宿主 /proc/device-tree/compatible 可读：$(tr '\0' ' ' < /proc/device-tree/compatible)"
+        elif [ -r /sys/firmware/devicetree/base/compatible ]; then
+            error "  宿主只有 /sys 下的设备树，/proc/device-tree 不存在（内核未开 CONFIG_PROC_DEVICETREE）"
+            error "  这种情况下挂进容器也没用：MPP 只读 /proc/device-tree，宿主上同样认不出 SoC"
+        else
+            error "  宿主自己也读不到 /sys/firmware/devicetree/base/compatible"
+            error "  这块板的内核没把设备树暴露出来（或不是 DT 启动），wire 里那段挂载判定会主动跳过；"
+            error "  MPP 只能按 RUNTIME 显式指定的 codec 工作，硬解是否真通要看 RUNTIME/scripts/verify_rk_media.sh"
+        fi
+        if [ -f "$dt_ovr" ] && grep -q '/sys/firmware/devicetree' "$dt_ovr"; then
+            info "  override 里已有设备树挂载：只差重建容器，$0 restart（内部 up -d --force-recreate）"
+        else
+            info "  override 里没有设备树挂载：确认板上脚本是新版，再 bash VIDEO/scripts/ensure_runtime_cpp.sh wire"
+        fi
+        if docker inspect "$VIDEO_CONTAINER" \
+                --format '{{range .Mounts}}{{.Source}}->{{.Destination}};{{end}}' 2>/dev/null \
+                | grep -q devicetree; then
+            info "  容器已挂载但仍读不到：容器内看 ls /sys/firmware/devicetree/base | head，"
+            info "  以及 ls -l /proc/device-tree（内核没编 CONFIG_PROC_DEVICETREE 时这个链接本身就不存在）"
+        else
+            info "  运行中的容器没有该挂载：$0 restart"
+        fi
     fi
     # rkmpp 后端是「直接链接」，不像 RKNN 那样 dlopen 失败可回落：
     # 容器里解析不到 librockchip_mpp 就是整个 RUNTIME 起不来，必须硬失败。
