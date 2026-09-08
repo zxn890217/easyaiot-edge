@@ -40,8 +40,10 @@ if command -v ldd >/dev/null 2>&1; then
   fi
 fi
 
-out="$("$BIN" --version 2>&1)" || true
-ec=$?
+# 注意别写成 `out="$(...)" || true; ec=$?`：|| true 会把 $? 变成 0，
+# 于是下面的分支永远走 SMOKE_OK，RUNTIME 起不来也报通过。
+ec=0
+out="$("$BIN" --version 2>&1)" || ec=$?
 echo "$out"
 
 if [[ "$ec" -eq 0 ]]; then
@@ -50,8 +52,14 @@ if [[ "$ec" -eq 0 ]]; then
 fi
 
 # 动态链接器失败
-if echo "$out" | grep -Eqi 'not found|GLIBCXX_|CXXABI_|GLIBC_'; then
-  if echo "$out" | grep -Ev "$cuda_noise" | grep -Eqi 'not found|GLIBCXX_|CXXABI_|GLIBC_'; then
+# 动态链接失败的特征。这里刻意不用裸 "not found"：链上 MPP 之后
+# RUNTIME --version 会打 "mpp_platform: can not found match soc name"（容器里
+# 读不到设备树），那是告警不是缺库，会被误判成加载失败。ldd 的缺库行长成
+# "libfoo.so => not found"，符号版本不兼容行长成 "version `GLIBC_2.29' not found"。
+dyn_fail='=>[[:space:]]*not found|version .*not found|cannot open shared object file|GLIBCXX_[0-9]|CXXABI_[0-9]|GLIBC_[0-9]'
+
+if echo "$out" | grep -Eqi "$dyn_fail"; then
+  if echo "$out" | grep -Ev "$cuda_noise" | grep -Eqi "$dyn_fail"; then
     echo "SMOKE_FAIL: 无法执行 --version (exit=$ec)" >&2
     exit 3
   fi

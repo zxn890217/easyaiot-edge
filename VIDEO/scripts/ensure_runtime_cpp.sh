@@ -126,6 +126,19 @@ wire_runtime_override() {
     print_info "检测到 rkmpp 运行库 ($mpp_ld_path)，已为 VIDEO 容器开启硬解/硬编通路"
   fi
 
+  # MPP 启动时靠 /proc/device-tree/compatible 认 SoC（rk3588 的平台 ops 就是这么选出来的）。
+  # /proc/device-tree 是指向 /sys/firmware/devicetree/base 的符号链接，而 docker 默认会在
+  # 容器里用 tmpfs 盖住 /sys（只单独透出 /sys/fs/cgroup），于是链接在容器内是悬空的，日志：
+  #   mpp[31]: mpp_soc: open /proc/device-tree/compatible error
+  #   mpp[31]: mpp_platform: can not found match soc name:
+  # 后果是 rkvdec/VEPU 拿不到匹配的平台实现，硬解/硬编行为不确定（不是「回落软解」这么简单）。
+  # 把设备树只读挂回去即可；宿主没有该路径（x86/ACPI 平台）时整段跳过，不影响其它部署。
+  local dt_volume_line=""
+  if [[ -r /sys/firmware/devicetree/base/compatible ]]; then
+    dt_volume_line="      - /sys/firmware/devicetree/base:/sys/firmware/devicetree/base:ro"
+    print_info "已为 VIDEO 容器只读挂载设备树 (/sys/firmware/devicetree/base)"
+  fi
+
   # Rockchip NPU (RK3588/RK356x): mount librknnrt.so + the device nodes the driver needs.
   # Only exist-verified nodes are added, otherwise docker-compose fails to start the service.
   #
@@ -219,6 +232,9 @@ wire_runtime_override() {
     fi
     if [[ -n "$rknn_volume_line" ]]; then
       echo "$rknn_volume_line"
+    fi
+    if [[ -n "$dt_volume_line" ]]; then
+      echo "$dt_volume_line"
     fi
     if [[ ${#device_nodes[@]} -gt 0 ]]; then
       echo "    devices:"

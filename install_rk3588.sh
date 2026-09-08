@@ -1085,31 +1085,63 @@ verify_container_side() {
         return 1
     fi
     local rc=0 out verdict
+    # 探针脚本里只用双引号：整段是 sh -c '…' 传给 docker exec 的，套单引号会截断。
     out="$(docker exec "$VIDEO_CONTAINER" sh -c '
+        # ls 带多个参数时，只要有一个不存在就整体返回非零。以前写成
+        #   ls A B … || echo "（容器内未找到）"
+        # 结果是把存在的 A 列出来之后，还额外印一句「未找到」，把成功的探测报成失败。
+        # 判空要看输出有没有内容，不能看 ls 的退出码。
+        emit() {
+            _label="$1"; shift
+            _got="$("$@" 2>/dev/null)"
+            if [ -n "$_got" ]; then printf "%s\n" "$_got"; else echo "$_label"; fi
+        }
         echo "-- 设备节点 --"
-        ls /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service /dev/vpu_service /dev/dri/renderD* /dev/dri/card* 2>/dev/null || echo "（无）"
-        ls -d /dev/dma_heap/* 2>/dev/null || echo "（无 /dev/dma_heap）"
+        emit "（无）" ls /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service /dev/vpu_service /dev/dri/renderD* /dev/dri/card*
+        emit "（无 /dev/dma_heap）" ls -d /dev/dma_heap/*
         echo "-- cgroup 设备白名单 --"
         cat /sys/fs/cgroup/devices/devices.list 2>/dev/null | grep -E "^c (226|10|241)" || true
         echo "-- librknnrt --"
-        ls -1 /opt/easyaiot/rknn-lib/librknnrt.so /usr/lib/librknnrt.so 2>/dev/null || echo "（容器内未找到）"
+        emit "（容器内未找到）" ls -1 /opt/easyaiot/rknn-lib/librknnrt.so /usr/lib/librknnrt.so
         echo "-- librockchip_mpp --"
-        ls -1 /opt/easyaiot/RUNTIME/.mpp-sdk/lib/librockchip_mpp.so* 2>/dev/null || echo "（容器内未找到）"
+        emit "（容器内未找到）" ls -1 /opt/easyaiot/RUNTIME/.mpp-sdk/lib/librockchip_mpp.so*
+        echo "-- MPP SoC 探测 --"
+        # MPP 靠 /proc/device-tree/compatible 认 rk3588；docker 默认用 tmpfs 盖住容器里的
+        # /sys（只单独透出 /sys/fs/cgroup），所以那个符号链接在容器内是悬空的。
+        if [ -r /proc/device-tree/compatible ]; then
+            tr "\0" " " < /proc/device-tree/compatible; echo ""
+        else
+            echo "DTREE_MISSING（容器内读不到 /proc/device-tree/compatible）"
+        fi
         echo "-- RUNTIME --"
-        test -x /opt/easyaiot/RUNTIME/build/RUNTIME && /opt/easyaiot/RUNTIME/build/RUNTIME --version 2>&1 | head -n2
+        if [ -x /opt/easyaiot/RUNTIME/build/RUNTIME ]; then
+            # mpp[x]: 开头的是 MPP 初始化日志，跟版本号混在一起会干扰下面的 grep，过滤掉
+            /opt/easyaiot/RUNTIME/build/RUNTIME --version 2>&1 | grep -v "^mpp\[" | head -n2
+        else
+            echo "（未编译：先跑 install_rk3588.sh build）"
+        fi
         echo "-- 动态库解析 --"
-        LC_ALL=C ldd /opt/easyaiot/RUNTIME/build/RUNTIME 2>/dev/null | grep -E "rknnrt|rockchip_mpp|drm|not found" || true
+        LC_ALL=C ldd /opt/easyaiot/RUNTIME/build/RUNTIME 2>/dev/null \
+            | grep -E "rknnrt|rockchip_mpp|libdrm|=>[[:space:]]*not found" || true
     ' 2>&1)" || { error "  docker exec 失败"; return 1; }
     echo "$out" | sed 's/^/  /'
-    echo "$out" | grep -q 'librknnrt.so' \
+    echo "$out" | grep -q 'librknnrt\.so' \
         || { error "  容器内看不到 librknnrt.so：dlopen 失败会回落 ONNX Runtime"; rc=1; }
-    echo "$out" | grep -q 'not found' \
+    # 只认 ldd 的 "libfoo.so => not found" 和加载器的 "version `GLIBC_x' not found"。
+    # 裸 grep not found 会把 MPP 自己的日志 "can not found match soc name" 当成缺库（假失败）。
+    echo "$out" | grep -Eq '=>[[:space:]]*not found|version .*not found' \
         && { error "  容器内有未解析的依赖库（见上方 not found）"; rc=1; }
     echo "$out" | grep -Eq '/dev/(rga|rknpu|mpp_service|dri/renderD)' \
         || { error "  容器内没有 NPU/MPP 设备节点：重建容器时确认 override 生效"; rc=1; }
+    if echo "$out" | grep -q 'DTREE_MISSING'; then
+        error "  容器内读不到设备树 —— MPP 认不出 SoC，rkvdec/VEPU 的平台匹配会失败"
+        error "  wire 时会自动把 /sys/firmware/devicetree/base 只读挂进容器；还报就说明"
+        error "  override 没生效：docker inspect $VIDEO_CONTAINER | grep -A8 Binds"
+        rc=1
+    fi
     # rkmpp 后端是「直接链接」，不像 RKNN 那样 dlopen 失败可回落：
     # 容器里解析不到 librockchip_mpp 就是整个 RUNTIME 起不来，必须硬失败。
-    if echo "$out" | grep -q 'librockchip_mpp.so.*not found'; then
+    if echo "$out" | grep -Eq 'librockchip_mpp\.so.*=>[[:space:]]*not found'; then
         error "  容器内解析不到 librockchip_mpp：RUNTIME 会直接起不来（不是回落软解）"
         error "  先确认 $0 mpp-setup 产出过 RUNTIME/.mpp-sdk/lib，再 wire + restart"
         rc=1
@@ -1149,6 +1181,10 @@ verify_services() {
         success "  VIDEO /actuator/health OK"
     else
         error "  VIDEO :6000 健康检查不可达"; rc=1
+        # 容器 running 但端口没起来，属应用侧启动失败（不是 NPU/编解码配置问题）。
+        # RUNTIME 是直链接二进制，缺任一依赖都会在加载期挂掉并带走整个服务。
+        info "  看启动日志定位：docker logs --tail=200 $VIDEO_CONTAINER"
+        info "  端口占用情况：ss -lntp | grep 6000"
     fi
     if curl -skf "https://127.0.0.1:${WEB_PORT}/health" >/dev/null 2>&1 \
        || curl -skf "https://127.0.0.1:${WEB_PORT}/" >/dev/null 2>&1; then
