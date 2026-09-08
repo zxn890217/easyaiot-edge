@@ -120,17 +120,31 @@ mpp_runtime_lib() {
   mpp_system_runtime_lib
 }
 
+# readelf 的标签列（"Shared library:" / "Library soname:"）会随 LC_MESSAGES 翻译，
+# zh_CN 下译成「共享库：」且与值之间没有空格，按 $NF 取字段会把译文前缀一起吃进来
+# （板上实测得到 "共享库：libm.so.6"，于是基线库被判成缺失依赖）。这里同时做两件事：
+# 锁 C locale，并且只取方括号里的内容，不再依赖字段位置。
+_mpp_dyn_field() {
+  local lib="$1" tag="$2" all="${3:-}"
+  local line
+  while IFS= read -r line; do
+    case "$line" in *"($tag)"*) : ;; *) continue ;; esac
+    line="${line#*[}"
+    line="${line%%]*}"
+    [[ -n "$line" ]] || continue
+    printf '%s\n' "$line"
+    [[ "$all" == all ]] || return 0
+  done < <(LC_ALL=C readelf -d "$lib" 2>/dev/null || true)
+}
+
 # SONAME 才是 ld 写进 DT_NEEDED 的名字（板上 librockchip_mpp.so.0 的 SONAME 是 .so.1），
 # 所以暂存目录里最终那份必须叫这个名字，否则容器里 ld.so 找不到。
 mpp_soname() {
   local lib="${1:-}" out=""
   [[ -f "$lib" ]] || return 1
-  if command -v readelf >/dev/null 2>&1; then
-    out="$(readelf -d "$lib" 2>/dev/null \
-           | awk '/\(SONAME\)/ {gsub(/[][()]/, "", $NF); print $NF; exit}')"
-  fi
+  out="$(_mpp_dyn_field "$lib" SONAME)"
   if [[ -z "$out" ]] && command -v objdump >/dev/null 2>&1; then
-    out="$(objdump -p "$lib" 2>/dev/null | awk '/SONAME/ {print $2; exit}')"
+    out="$(LC_ALL=C objdump -p "$lib" 2>/dev/null | awk '/^[ \t]*SONAME[ \t]/{print $2; exit}')"
   fi
   [[ -n "$out" ]] || out="$(basename "$lib")"
   printf '%s\n' "$out"
@@ -139,15 +153,16 @@ mpp_soname() {
 # DT_NEEDED 列表：判断容器里是否还缺 libdrm.so.2 之类的传递依赖。
 # 缺一个就整个 RUNTIME 起不来（直接链接的二进制，加载期解析失败没有回落可言）。
 mpp_lib_needed() {
-  local lib="${1:-}"
+  local lib="${1:-}" out=""
   [[ -f "$lib" ]] || return 1
-  if command -v readelf >/dev/null 2>&1; then
-    readelf -d "$lib" 2>/dev/null \
-      | awk '/\(NEEDED\)/ {gsub(/[][()]/, "", $NF); print $NF}'
-    return 0
+  out="$(_mpp_dyn_field "$lib" NEEDED all)"
+  # 没有 readelf（或它没吐出东西）时才退到 objdump：objdump -p 的列不受译文影响
+  if [[ -z "$out" ]]; then
+    command -v objdump >/dev/null 2>&1 || return 1
+    out="$(LC_ALL=C objdump -p "$lib" 2>/dev/null | awk '/^[ \t]*NEEDED[ \t]/{print $2}')"
+    [[ -n "$out" ]] || return 1
   fi
-  command -v objdump >/dev/null 2>&1 || return 1
-  objdump -p "$lib" 2>/dev/null | awk '/NEEDED/ {print $2}'
+  printf '%s\n' "$out"
 }
 
 # Verneed 全表（list 模式自带 elf_hash 自检：存表里的哈希能复现，才允许写）

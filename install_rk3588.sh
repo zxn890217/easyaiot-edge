@@ -469,6 +469,17 @@ MPP_BASE_LIBS=" libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libuti
                libresolv.so.1 libnss_files.so.2 libstdc++.so.6 libgcc_s.so.1
                ld-linux-aarch64.so.1 ld-linux-x86-64.so.2 "
 
+# 名字是否命中基线库。这里不能写成 `case "$MPP_BASE_LIBS" in *" $need "*` ——
+# 那个串是多行的，libutil.so.1 后面跟的是换行而不是空格，永远匹配不上，
+# 结果就是宿主 glibc 被 cp 进 .mpp-sdk/lib 顶掉容器自己那份（直接 SIGSEGV）。
+_mpp_is_base_lib() {
+    local name="$1" base
+    for base in $MPP_BASE_LIBS; do
+        [ "$base" = "$name" ] && return 0
+    done
+    return 1
+}
+
 # 把 soname 的 DT_NEEDED 里「容器没有、宿主有」的那些补进 $2 目录，同样过一遍 glibc 补丁。
 # 返回非 0 表示有依赖既不在容器里也搬不过来 —— 调用方告警即可，暂存目录仍然可用。
 _mpp_stage_deps() {
@@ -478,7 +489,7 @@ _mpp_stage_deps() {
     needed="$(mpp_lib_needed "$lib" 2>/dev/null || true)"
     [ -n "$needed" ] || return 0   # 没有 readelf/objdump：跳过，交给运行期报错
     for need in $needed; do
-        case "$MPP_BASE_LIBS" in *" $need "*) continue ;; esac
+        if _mpp_is_base_lib "$need"; then continue; fi
         local have=0
         container_has_lib "$need" || have=$?
         if [ "$have" = "0" ]; then
@@ -1087,7 +1098,7 @@ verify_container_side() {
         echo "-- RUNTIME --"
         test -x /opt/easyaiot/RUNTIME/build/RUNTIME && /opt/easyaiot/RUNTIME/build/RUNTIME --version 2>&1 | head -n2
         echo "-- 动态库解析 --"
-        ldd /opt/easyaiot/RUNTIME/build/RUNTIME 2>/dev/null | grep -E "rknnrt|rockchip_mpp|drm|not found" || true
+        LC_ALL=C ldd /opt/easyaiot/RUNTIME/build/RUNTIME 2>/dev/null | grep -E "rknnrt|rockchip_mpp|drm|not found" || true
     ' 2>&1)" || { error "  docker exec 失败"; return 1; }
     echo "$out" | sed 's/^/  /'
     echo "$out" | grep -q 'librknnrt.so' \

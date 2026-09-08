@@ -796,10 +796,14 @@ section_b() {
         note "RUNTIME 二进制：$bin"
         "$bin" --version 2>&1 | head -2 | indent || true
         local needed
-        if command -v readelf >/dev/null 2>&1; then
-            needed="$(readelf -d "$bin" 2>/dev/null | awk '/\(NEEDED\)/ {gsub(/[][()]/, "", $NF); print $NF}' | tr '\n' ' ' || true)"
+        # 复用 mpp_sdk.sh 那份解析（它锁了 C locale 并只取方括号内的值）：
+        # readelf 的 "Shared library:" 标签在 zh_CN 下会与值粘成一个字段，按 $NF 取会连着译文一起拿
+        if declare -F mpp_lib_needed >/dev/null 2>&1; then
+            needed="$(mpp_lib_needed "$bin" 2>/dev/null | tr '\n' ' ' || true)"
+        elif command -v readelf >/dev/null 2>&1; then
+            needed="$(LC_ALL=C readelf -d "$bin" 2>/dev/null | awk -F'[][]' '/\(NEEDED\)/ {print $2}' | tr '\n' ' ' || true)"
         elif command -v objdump >/dev/null 2>&1; then
-            needed="$(objdump -p "$bin" 2>/dev/null | awk '/NEEDED/ {print $2}' | tr '\n' ' ' || true)"
+            needed="$(LC_ALL=C objdump -p "$bin" 2>/dev/null | awk '/^[[:space:]]*NEEDED[[:space:]]/ {print $2}' | tr '\n' ' ' || true)"
         fi
         BIN_NEEDED="${needed// /,}"
         if [[ -z "$needed" ]]; then
@@ -813,7 +817,8 @@ section_b() {
         fi
         if command -v ldd >/dev/null 2>&1; then
             local ldd_out miss
-            ldd_out="$(ldd "$bin" 2>&1 || true)"
+            # LC_ALL=C：ldd 的 "not found" 在 zh_CN 下会译成中文，grep 直接失效
+            ldd_out="$(LC_ALL=C ldd "$bin" 2>&1 || true)"
             if ! printf '%s' "$ldd_out" | grep -qE '\.so|statically linked|not a dynamic'; then
                 skip "ldd 读不出 $bin 的依赖（架构不匹配 / 非 ELF），跳过动态库解析检查"
             else

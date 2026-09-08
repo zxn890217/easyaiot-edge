@@ -118,7 +118,9 @@ collect_libs() {
     if [[ -n "$real" && "$real" != "$so" ]]; then
       cp -L -f "$real" "$dest_lib/$(basename "$real")" 2>/dev/null || true
     fi
-  done < <(ldd "$bin" 2>/dev/null || true)
+  # LC_ALL=C：未解析的行在 zh_CN 下印成「libfoo.so.1 => 未找到」，$3 拿到的是
+  # 译文而非 "not"，上面那层跳过判断就形同虚设
+  done < <(LC_ALL=C ldd "$bin" 2>/dev/null || true)
 
   copy_named_libs_from "$conda_lib"
 }

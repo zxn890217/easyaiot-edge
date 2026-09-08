@@ -30,7 +30,9 @@ fi
 cuda_noise='libcuda\.so|libcudart|libcublas|libcudnn|libnvinfer|libnvrtc|libnvidia'
 
 if command -v ldd >/dev/null 2>&1; then
-  miss="$(ldd "$BIN" 2>/dev/null | grep 'not found' | grep -Ev "$cuda_noise" || true)"
+  # LC_ALL=C：ldd 的 "not found" 会随 locale 翻译（zh_CN 下是「未找到」），
+  # 不锁住的话这条 grep 永远不命中，缺库的二进制会被判成 smoke 通过
+  miss="$(LC_ALL=C ldd "$BIN" 2>/dev/null | grep 'not found' | grep -Ev "$cuda_noise" || true)"
   if [[ -n "$miss" ]]; then
     echo "SMOKE_FAIL: 动态库缺失（非 CUDA）:" >&2
     echo "$miss" >&2
