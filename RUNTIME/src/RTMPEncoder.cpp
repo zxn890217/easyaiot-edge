@@ -183,6 +183,37 @@ bool RTMPEncoder::setupVideoStream() {
     return true;
 }
 
+int64_t RTMPEncoder::nextWallTick(int64_t captureNs) {
+    // Wall-clock PTS derivation.  We express elapsed milliseconds relative to
+    // the first accepted frame and rescale them into the mux time_base.  This
+    // gives the FLV muxer a true VFR timeline (mirroring VIDEO's Python relay
+    // default of `-fps_mode vfr`) so a slow inference loop no longer stretches
+    // or squeezes the stream and the player stops seeing "the last few seconds
+    // repeated / jittering".
+    if (!_videoStream || captureNs <= 0) {
+        return -1;
+    }
+    const AVRational tb = _videoStream->time_base;
+    if (tb.num <= 0 || tb.den <= 0) {
+        return -1;
+    }
+    if (_firstCaptureNs == 0) {
+        _firstCaptureNs = captureNs;
+    }
+    int64_t elapsedNs = captureNs - _firstCaptureNs;
+    if (elapsedNs < 0) {
+        // Backwards clock jump (should not happen with MONOTONIC, defensive only).
+        elapsedNs = 0;
+    }
+    int64_t ms = elapsedNs / 1000000;
+    int64_t tick = av_rescale_q(ms, AVRational{1, 1000}, tb);
+    if (_lastWallTick >= 0 && tick <= _lastWallTick) {
+        tick = _lastWallTick + 1;
+    }
+    _lastWallTick = tick;
+    return tick;
+}
+
 bool RTMPEncoder::writeAvccPacket(const uint8_t* data, int size, int64_t frameIndex, bool key) {
     if (!_outputCtx || !_videoStream || !_packet) {
         return false;
@@ -246,7 +277,7 @@ bool RTMPEncoder::openMppEncoder(const RtmpEncoderOptions& opts) {
     return true;
 }
 
-bool RTMPEncoder::encodeAndPushMpp(const cv::Mat& frame) {
+bool RTMPEncoder::encodeAndPushMpp(const cv::Mat& frame, int64_t captureNs) {
     cv::Mat bgr = frame;
     if (frame.cols != _srcWidth || frame.rows != _srcHeight) {
         cv::resize(frame, bgr, cv::Size(_srcWidth, _srcHeight), 0, 0, cv::INTER_AREA);
@@ -278,7 +309,12 @@ bool RTMPEncoder::encodeAndPushMpp(const cv::Mat& frame) {
         return false;
     }
 
-    if (!_mpp->submit()) {
+    // Wall-clock tick in the mux time_base.  MppEncoder echoes it back on the
+    // corresponding MppEncPacket so muxing sees a true VFR stream.  -1 tells
+    // MppEncoder to keep using its legacy per-frame counter.
+    const int64_t wallTick = nextWallTick(captureNs);
+
+    if (!_mpp->submit(wallTick)) {
         LOG(ERROR) << "[RTMP] VEPU submit failed: " << _mpp->lastError();
         return false;
     }
@@ -485,13 +521,15 @@ bool RTMPEncoder::init(const std::string& rtmpUrl, int width, int height, int fp
 
     _initialized = true;
     _frameIndex = 0;
+    _firstCaptureNs = 0;
+    _lastWallTick = -1;
 
     LOG(INFO) << "[RTMP] Encoder initialized successfully encode_ep=" << _encodeEp
               << " url=" << rtmpUrl;
     return true;
 }
 
-bool RTMPEncoder::encodeAndPush(const cv::Mat& frame) {
+bool RTMPEncoder::encodeAndPush(const cv::Mat& frame, int64_t captureNs) {
     if (!_initialized) {
         LOG(ERROR) << "[RTMP] Encoder not initialized";
         return false;
@@ -504,7 +542,7 @@ bool RTMPEncoder::encodeAndPush(const cv::Mat& frame) {
 
 #ifdef RUNTIME_WITH_MPP
     if (_mpp) {
-        return encodeAndPushMpp(frame);
+        return encodeAndPushMpp(frame, captureNs);
     }
 #endif
 
@@ -524,7 +562,18 @@ bool RTMPEncoder::encodeAndPush(const cv::Mat& frame) {
         return false;
     }
 
-    _yuvFrame->pts = _frameIndex;
+    // Wall-clock tick in the codec time_base (mirrors the MPP path above).
+    // x264/NVENC are configured with no B frames, so input and output picture
+    // order stay 1:1 and the avcodec-internal PTS we assign here reaches
+    // av_packet_rescale_ts() unchanged on the mux side.  When captureNs is
+    // unavailable we fall back to the legacy frame-index CFR, matching the
+    // previous behaviour.
+    const int64_t wallTick = nextWallTick(captureNs);
+    if (wallTick >= 0) {
+        _yuvFrame->pts = wallTick;
+    } else {
+        _yuvFrame->pts = _frameIndex;
+    }
     _frameIndex++;
 
     ret = avcodec_send_frame(_codecCtx, _yuvFrame);

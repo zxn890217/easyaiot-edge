@@ -77,8 +77,20 @@ public:
     uint8_t* acquireInput();
     /** Chroma plane of the same slot (NV12: interleaved UV, horStride * h/2). */
     uint8_t* acquireInputChroma();
-    /** Hand what acquireInput() filled over to VEPU. */
-    bool submit();
+    /**
+     * Hand what acquireInput() filled over to VEPU.
+     *
+     * @param pts  Caller-supplied timestamp in the mux time_base ticks
+     *             (see RTMPEncoder's wall-clock conversion).  Pass <0 to fall
+     *             back to the previous per-frame ++ counter (used by EOS and
+     *             by callers that have no capture stamp).
+     *
+     * The value is stored on the MppFrame and echoed back on the matching
+     * MppEncPacket so the muxer can emit a VFR-friendly timeline instead of
+     * the "one tick per frameIndex" CFR we used before, which made the stream
+     * stretch/squeeze every time inference throttled the supply rate.
+     */
+    bool submit(int64_t pts = -1);
     /** Number of input slots currently available. */
     int freeInputSlots() const { return static_cast<int>(freeSlots_.size()); }
 
@@ -132,7 +144,8 @@ private:
     std::vector<Slot> slots_;
     std::deque<size_t> freeSlots_;
     std::deque<InFlight> pending_;  // submitted frames still inside VEPU, FIFO
-    int64_t nextPts_ = 0;
+    int64_t nextPts_ = 0;           // fallback counter when caller passes pts<0
+    int64_t lastPts_ = -1;          // last timestamp handed to VEPU, for monotonic guard
     bool eosSent_ = false;
 
     std::vector<uint8_t> extradata_;

@@ -754,7 +754,12 @@ void Pipeline::inferLoop() {
 
         if (streamingFn_ && streamingFn_() && rtmpEncoder_ && *rtmpEncoder_ &&
             (*rtmpEncoder_)->isInitialized()) {
-            (*rtmpEncoder_)->encodeAndPush(img);
+            // Forward the wall-clock capture stamp so the muxer can emit a
+            // true VFR timeline.  Without it the RTMP encoder falls back to
+            // "one tick per frameIndex", which stretches the stream whenever
+            // inference throttles the supply rate and shows up as jitter plus
+            // repeated frames in the last few seconds on RK3588.
+            (*rtmpEncoder_)->encodeAndPush(img, static_cast<int64_t>(slot->captureNs));
         }
 
         if (metrics_) {

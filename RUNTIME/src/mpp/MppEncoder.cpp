@@ -260,6 +260,7 @@ void MppEncoder::close() {
     }
     extradata_.clear();
     nextPts_ = 0;
+    lastPts_ = -1;
     eosSent_ = false;
 }
 
@@ -273,24 +274,39 @@ uint8_t* MppEncoder::acquireInputChroma() {
     return slots_[freeSlots_.front()].ptr + static_cast<size_t>(horStride_) * verStride_;
 }
 
-bool MppEncoder::submit() {
+bool MppEncoder::submit(int64_t pts) {
     if (!ctx_ || freeSlots_.empty()) return false;
     const size_t index = freeSlots_.front();
     freeSlots_.pop_front();
 
+    // Resolve the timestamp handed to VEPU.  Caller-supplied values win so the
+    // muxed stream can carry a true wall-clock timeline (VFR).  Anything that
+    // does not fit the monotonic++ contract (out-of-order, duplicate, or the
+    // sentinel -1) silently degrades to the legacy per-frame counter.
+    int64_t effectivePts = pts;
+    if (effectivePts < 0 || effectivePts <= lastPts_) {
+        effectivePts = nextPts_;
+    }
+    if (effectivePts <= lastPts_) {
+        effectivePts = lastPts_ + 1;
+    }
+    lastPts_ = effectivePts;
+    if (effectivePts >= nextPts_) {
+        nextPts_ = effectivePts + 1;
+    }
+
     Slot& slot = slots_[index];
-    mpp_frame_set_pts(slot.frame, static_cast<RK_S64>(nextPts_));
+    mpp_frame_set_pts(slot.frame, static_cast<RK_S64>(effectivePts));
     mpp_frame_set_eos(slot.frame, 0);
 
     const int rc = mpi_->encode_put_frame(ctx_, slot.frame);
     if (rc) {
         lastError_ = "encode_put_frame rc=" + std::to_string(rc);
-        LOG(WARNING) << "[MPP-ENC] " << lastError_ << ", dropping pts=" << nextPts_;
+        LOG(WARNING) << "[MPP-ENC] " << lastError_ << ", dropping pts=" << effectivePts;
         freeSlots_.push_back(index);
         return false;
     }
-    pending_.push_back(InFlight{index, nextPts_});
-    ++nextPts_;
+    pending_.push_back(InFlight{index, effectivePts});
     return true;
 }
 

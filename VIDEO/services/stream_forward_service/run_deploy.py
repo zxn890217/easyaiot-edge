@@ -1367,6 +1367,20 @@ def _build_native_ffmpeg_copy_cmd(device_id: str, rtsp_url: str, rtmp_url: str) 
     return cmd
 
 
+def _resolve_relay_fps_mode() -> str:
+    """输出侧帧率模式：vfr=按源帧透传（默认，消除 CPU 争抢时的重复/抖动）；cfr=旧行为（定帧率补齐）。
+
+    背景：观感推流在 CPU 被算法任务压满时，源侧帧到达节奏会显著拖慢。此时
+    -fps_mode cfr -r 25 会让 FFmpeg 主动复制帧或丢帧凑数，直接表现为
+    "近几秒内画面抖动 + 播放重复帧"。默认切到 vfr 后，帧率随源真实节奏，
+    不再人为补帧；代价是播放器看到的 fps 会波动，但不会重复。
+    """
+    mode = os.getenv('STREAM_FORWARD_FPS_MODE', 'vfr').strip().lower()
+    if mode not in ('vfr', 'cfr'):
+        return 'vfr'
+    return mode
+
+
 def _native_relay_encode_options(
     device_id: str,
     use_hardware: bool,
@@ -1379,10 +1393,19 @@ def _native_relay_encode_options(
     if caps.get('max_muxing_queue_size'):
         opts.extend(['-max_muxing_queue_size', str(_resolve_relay_mux_queue_size())])
     push_fps = max(1, int(push_fps))
-    if caps.get('fps_mode'):
-        opts.extend(['-fps_mode', 'cfr', '-r', str(push_fps)])
+    fps_mode = _resolve_relay_fps_mode()
+    if fps_mode == 'cfr':
+        # 旧行为：定帧率补齐，CPU 紧张时会产生重复帧与抖动
+        if caps.get('fps_mode'):
+            opts.extend(['-fps_mode', 'cfr', '-r', str(push_fps)])
+        else:
+            opts.extend(['-vsync', 'cfr', '-r', str(push_fps)])
     else:
-        opts.extend(['-vsync', 'cfr', '-r', str(push_fps)])
+        # vfr：只丢不加，不复制帧；不强制 -r，让输出跟随源 PTS
+        if caps.get('fps_mode'):
+            opts.extend(['-fps_mode', 'vfr'])
+        else:
+            opts.extend(['-vsync', 'vfr'])
     if use_hardware:
         ffmpeg_gpu_id = get_ffmpeg_gpu_id(device_id)
         opts.extend([
@@ -1444,10 +1467,10 @@ def _build_native_ffmpeg_relay_cmd(
     cmd.extend(['-f', 'flv', '-flvflags', 'no_duration_filesize', rtmp_url])
 
     logger.info(
-        '设备推流 [%s]: 编码 %s, 输出 %dx%d@%sfps, 档位=%s',
+        '设备推流 [%s]: 编码 %s, 输出 %dx%d@%sfps(%s), 档位=%s',
         device_id,
         'h264_nvenc' if use_hardware else 'libx264',
-        target_w, target_h, push_fps, profile_name,
+        target_w, target_h, push_fps, _resolve_relay_fps_mode(), profile_name,
     )
     return cmd
 

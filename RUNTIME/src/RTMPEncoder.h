@@ -54,7 +54,14 @@ public:
     bool init(const std::string& rtmpUrl, int width, int height, int fps,
               const RtmpEncoderOptions& opts = RtmpEncoderOptions());
 
-    bool encodeAndPush(const cv::Mat& frame);
+    /**
+     * Encode one BGR frame and mux it into the RTMP stream using the caller's
+     * capture timestamp as PTS.  Passing 0/negative falls back to the legacy
+     * per-frame counter (frameIndex ticks of 1/fps) which stretches the
+     * timeline whenever inference throttles the supply rate and produces the
+     * "stutter + repeated frames in the last few seconds" symptom on RK3588.
+     */
+    bool encodeAndPush(const cv::Mat& frame, int64_t captureNs = 0);
 
     void release();
 
@@ -69,12 +76,18 @@ private:
     /** Open VEPU and publish its SPS/PPS as the stream's AVCC extradata. */
     bool openMppEncoder(const RtmpEncoderOptions& opts);
     /** BGR -> NV12 straight into the VEPU input buffer, then mux what came back. */
-    bool encodeAndPushMpp(const cv::Mat& frame);
+    bool encodeAndPushMpp(const cv::Mat& frame, int64_t captureNs);
 #endif
     /** Describe the elementary stream to the FLV muxer (both encoder families). */
     bool setupVideoStream();
     /** Mux one already-encoded H.264 AVCC access unit. */
     bool writeAvccPacket(const uint8_t* data, int size, int64_t frameIndex, bool key);
+    /**
+     * Convert a wall-clock capture stamp into mux time_base ticks, keeping the
+     * result strictly increasing.  Returns -1 when no valid stamp is available
+     * so callers can fall back to the legacy frame-index path.
+     */
+    int64_t nextWallTick(int64_t captureNs);
     static int alignDim(int v, int align = 16);
     static int64_t defaultBitRate(int width, int height);
 
@@ -87,6 +100,8 @@ private:
     runtime::mpp::MppEncoder* _mpp; // VEPU 编码器（未编译 MPP 后端时恒为 null）
 
     int64_t _frameIndex;
+    int64_t _firstCaptureNs = 0;    // 首帧墙钟，用作 VFR PTS 基准
+    int64_t _lastWallTick = -1;     // 上一帧写入 mux 的 tick，保证严格单调
     int _srcWidth;                  // OpenCV 输入宽
     int _srcHeight;
     int _encWidth;                  // 编码器宽（NVENC 16 对齐）
