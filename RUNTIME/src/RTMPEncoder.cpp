@@ -184,17 +184,16 @@ bool RTMPEncoder::setupVideoStream() {
 }
 
 int64_t RTMPEncoder::nextWallTick(int64_t captureNs) {
-    // Wall-clock PTS derivation.  We express elapsed milliseconds relative to
-    // the first accepted frame and rescale them into the mux time_base.  This
-    // gives the FLV muxer a true VFR timeline (mirroring VIDEO's Python relay
-    // default of `-fps_mode vfr`) so a slow inference loop no longer stretches
-    // or squeezes the stream and the player stops seeing "the last few seconds
-    // repeated / jittering".
-    if (!_videoStream || captureNs <= 0) {
-        return -1;
-    }
-    const AVRational tb = _videoStream->time_base;
-    if (tb.num <= 0 || tb.den <= 0) {
+    // Wall-clock PTS derivation, expressed in **milliseconds** (i.e. a fixed
+    // AVRational{1, 1000} time base) so it stays independent of whatever the
+    // muxer happens to rewrite _videoStream->time_base to after write_header.
+    // writeAvccPacket() rescales these ms into the current stream time_base at
+    // the exact moment it needs one, and the libx264/NVENC path rescales into
+    // _codecCtx->time_base before avcodec_receive_packet() runs its own
+    // rescale.  This mirrors VIDEO's Python relay default of `-fps_mode vfr`,
+    // so a slow inference loop no longer stretches or squeezes the timeline
+    // and the player stops seeing "the last few seconds repeated / jittering".
+    if (captureNs <= 0) {
         return -1;
     }
     if (_firstCaptureNs == 0) {
@@ -206,15 +205,14 @@ int64_t RTMPEncoder::nextWallTick(int64_t captureNs) {
         elapsedNs = 0;
     }
     int64_t ms = elapsedNs / 1000000;
-    int64_t tick = av_rescale_q(ms, AVRational{1, 1000}, tb);
-    if (_lastWallTick >= 0 && tick <= _lastWallTick) {
-        tick = _lastWallTick + 1;
+    if (_lastWallTick >= 0 && ms <= _lastWallTick) {
+        ms = _lastWallTick + 1;
     }
-    _lastWallTick = tick;
-    return tick;
+    _lastWallTick = ms;
+    return ms;
 }
 
-bool RTMPEncoder::writeAvccPacket(const uint8_t* data, int size, int64_t frameIndex, bool key) {
+bool RTMPEncoder::writeAvccPacket(const uint8_t* data, int size, int64_t ptsMs, bool key) {
     if (!_outputCtx || !_videoStream || !_packet) {
         return false;
     }
@@ -228,12 +226,16 @@ bool RTMPEncoder::writeAvccPacket(const uint8_t* data, int size, int64_t frameIn
     }
     memcpy(_packet->data, data, static_cast<size_t>(size));
 
-    // MppEncoder numbers frames in encode-order ticks of 1/fps; the muxer works
-    // in its own time_base (FLV rewrites it to 1/1000 during write_header).
-    const int64_t ts = av_rescale_q(frameIndex, AVRational{1, _fps}, _videoStream->time_base);
+    // `ptsMs` is a millisecond-unit wall-clock tick produced by nextWallTick().
+    // We rescale here (rather than earlier) because FLV rewrites
+    // _videoStream->time_base to {1, 1000} during avformat_write_header(),
+    // which would otherwise double-scale MPP-path pts and make the timeline
+    // grow at ~fps/1000 of real time -- exactly the "recent-seconds jitter +
+    // repeated frames" symptom we are fixing.
+    const int64_t ts = av_rescale_q(ptsMs, AVRational{1, 1000}, _videoStream->time_base);
     _packet->pts = ts;
     _packet->dts = ts;  // VEPU and libx264 both run with no B frames
-    _packet->duration = av_rescale_q(1, AVRational{1, _fps}, _videoStream->time_base);
+    _packet->duration = av_rescale_q(1, AVRational{1, 1000}, _videoStream->time_base);
     _packet->stream_index = _videoStream->index;
     _packet->flags = key ? AV_PKT_FLAG_KEY : 0;
 
@@ -570,7 +572,9 @@ bool RTMPEncoder::encodeAndPush(const cv::Mat& frame, int64_t captureNs) {
     // previous behaviour.
     const int64_t wallTick = nextWallTick(captureNs);
     if (wallTick >= 0) {
-        _yuvFrame->pts = wallTick;
+        // `wallTick` is in milliseconds; x264/NVENC expect pts in
+        // _codecCtx->time_base (typically {1, 1/fps} or {1, 1000000}).
+        _yuvFrame->pts = av_rescale_q(wallTick, AVRational{1, 1000}, _codecCtx->time_base);
     } else {
         _yuvFrame->pts = _frameIndex;
     }

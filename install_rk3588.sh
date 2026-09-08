@@ -783,7 +783,24 @@ build_runtime_arm() {
         warn "EASYAIOT_RUNTIME_SKIP=1，跳过 RUNTIME 编译"
         return 0
     fi
-    step "编译 RUNTIME（RUNTIME_WITH_RKNN=$RUNTIME_WITH_RKNN RUNTIME_WITH_MPP=$RUNTIME_WITH_MPP）"
+    # 兜底 1：显式声明 docker 同源容器编译，避免 RUNTIME/install_linux.sh 在
+    # TTY 下弹交互菜单；用户曾选 1（host）→ CMakeCache.txt 里的源目录是
+    # 上次 docker 留下的 /src/RUNTIME/build，与 host 路径不匹配就直接 cmake 失败。
+    # 若要强制 host：先 export EASYAIOT_RUNTIME_BUILD_MODE=host 再跑本脚本。
+    export EASYAIOT_RUNTIME_BUILD_MODE="${EASYAIOT_RUNTIME_BUILD_MODE:-docker}"
+    # 兜底 2：若上一次编译留下 CMakeCache 且其源路径与当前仓库根不匹配
+    # （典型：宿主 build 目录里躺着 /src/RUNTIME 的 cache，或反之），
+    # 自动清 build 目录，避免 update 流程再次卡在同一坑里。
+    local cache="$SCRIPT_DIR/RUNTIME/build/CMakeCache.txt"
+    if [ -f "$cache" ]; then
+        local recorded
+        recorded="$(grep -m1 '^CMAKE_HOME_DIRECTORY:' "$cache" 2>/dev/null | awk -F= '{print $2}' | tr -d '[:space:]')"
+        if [ -n "$recorded" ] && [ "$recorded" != "$SCRIPT_DIR/RUNTIME" ]; then
+            warn "  检测到旧 CMakeCache 源路径不匹配（记录=$recorded，当前=$SCRIPT_DIR/RUNTIME），自动清理 RUNTIME/build"
+            rm -rf "$SCRIPT_DIR/RUNTIME/build"
+        fi
+    fi
+    step "编译 RUNTIME（RUNTIME_WITH_RKNN=$RUNTIME_WITH_RKNN RUNTIME_WITH_MPP=$RUNTIME_WITH_MPP 模式=$EASYAIOT_RUNTIME_BUILD_MODE）"
     if ! bash RUNTIME/install_linux.sh build; then
         error "RUNTIME 编译失败"
         return 1

@@ -80,12 +80,15 @@ private:
 #endif
     /** Describe the elementary stream to the FLV muxer (both encoder families). */
     bool setupVideoStream();
-    /** Mux one already-encoded H.264 AVCC access unit. */
-    bool writeAvccPacket(const uint8_t* data, int size, int64_t frameIndex, bool key);
+    /** Mux one already-encoded H.264 AVCC access unit; `ptsMs` is milliseconds. */
+    bool writeAvccPacket(const uint8_t* data, int size, int64_t ptsMs, bool key);
     /**
-     * Convert a wall-clock capture stamp into mux time_base ticks, keeping the
-     * result strictly increasing.  Returns -1 when no valid stamp is available
-     * so callers can fall back to the legacy frame-index path.
+     * Convert a wall-clock capture stamp into a monotonically increasing
+     * millisecond-unit tick (AVRational{1, 1000}).  Independent of the muxer
+     * time_base so a slow inference loop no longer stretches the timeline
+     * (the "recent-seconds jitter + repeated frames" fix).  Returns -1 when
+     * no valid stamp is available so callers fall back to the legacy
+     * per-frame counter.
      */
     int64_t nextWallTick(int64_t captureNs);
     static int alignDim(int v, int align = 16);
