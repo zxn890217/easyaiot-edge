@@ -226,7 +226,7 @@ RtmpEncoderOptions makeRtmpOpts(const Config& cfg) {
     RtmpEncoderOptions opts;
     // hwaccelEncodeEnabled() already folds in prefer_hwaccel / force_soft_av /
     // hwaccel=none, so the encoder only needs the verdict plus the family name.
-    opts.preferHw = runtime::hwaccelEncodeEnabled(cfg);
+    opts.preferHw = hwaccelEncodeEnabled(cfg);
     opts.forceSoft = !opts.preferHw;
     opts.hwaccel = cfg.hwaccel;
     opts.gpuDeviceId = cfg.hwaccelDeviceId >= 0 ? cfg.hwaccelDeviceId : cfg.gpuDeviceId;
@@ -511,8 +511,8 @@ void Detech::_controlServerThreadFunc() {
             // What was asked for, alongside the decode_ep / encode_ep verdicts
             // above, so a fallback to CPU is distinguishable from a misconfig.
             response["hwaccel"] = this->_config.hwaccel;
-            response["hwaccel_decode"] = runtime::hwaccelDecodeEnabled(this->_config);
-            response["hwaccel_encode"] = runtime::hwaccelEncodeEnabled(this->_config);
+            response["hwaccel_decode"] = hwaccelDecodeEnabled(this->_config);
+            response["hwaccel_encode"] = hwaccelEncodeEnabled(this->_config);
             response["infer_backend"] = this->_config.inferBackend.empty()
                 ? "auto"
                 : this->_config.inferBackend;
@@ -698,8 +698,8 @@ bool Detech::_init_media_player() {
               << " hwaccel=" << (_config.hwaccel.empty() ? "auto" : _config.hwaccel)
               << " prefer_hwaccel=" << (_config.preferHwaccel ? "true" : "false")
               << " force_soft_av=" << (_config.forceSoftAv ? "true" : "false")
-              << " hwaccel_decode=" << (runtime::hwaccelDecodeEnabled(_config) ? "true" : "false")
-              << " hwaccel_encode=" << (runtime::hwaccelEncodeEnabled(_config) ? "true" : "false")
+              << " hwaccel_decode=" << (hwaccelDecodeEnabled(_config) ? "true" : "false")
+              << " hwaccel_encode=" << (hwaccelEncodeEnabled(_config) ? "true" : "false")
               << " hwaccel_device_id=" << _config.hwaccelDeviceId;
     if (!_ffmpegFormatCtx) {
         _ffmpegFormatCtx = avformat_alloc_context();
@@ -732,7 +732,7 @@ bool Detech::_init_media_player() {
     _videoIndex = av_find_best_stream(_ffmpegFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (_videoIndex > -1) {
         AVCodecParameters* videoCodecPar = _ffmpegFormatCtx->streams[_videoIndex]->codecpar;
-        const bool hwDecode = runtime::hwaccelDecodeEnabled(_config);
+        const bool hwDecode = hwaccelDecodeEnabled(_config);
         if (!runtime::openVideoDecoder(&_ffmpegCodecCtx, videoCodecPar,
                                        hwDecode,
                                        !hwDecode,
