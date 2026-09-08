@@ -1,8 +1,14 @@
 #include "RTMPEncoder.h"
 #include <climits>
 #include <cstdio>
+#include <cstring>
 #include <glog/logging.h>
 #include <algorithm>
+#include <vector>
+
+#ifdef RUNTIME_WITH_MPP
+#include "mpp/MppEncoder.h"
+#endif
 
 RTMPEncoder::RTMPEncoder()
     : _outputCtx(nullptr)
@@ -11,6 +17,7 @@ RTMPEncoder::RTMPEncoder()
     , _swsCtx(nullptr)
     , _yuvFrame(nullptr)
     , _packet(nullptr)
+    , _mpp(nullptr)
     , _frameIndex(0)
     , _srcWidth(0)
     , _srcHeight(0)
@@ -116,6 +123,180 @@ bool RTMPEncoder::openEncoder(const AVCodec* codec, bool isNvenc, const RtmpEnco
     return true;
 }
 
+bool RTMPEncoder::setupVideoStream() {
+    _videoStream = avformat_new_stream(_outputCtx, nullptr);
+    if (!_videoStream) {
+        LOG(ERROR) << "[RTMP] Failed to create video stream";
+        return false;
+    }
+
+#ifdef RUNTIME_WITH_MPP
+    if (_mpp) {
+        _videoStream->time_base = AVRational{1, _fps};
+        _videoStream->avg_frame_rate = AVRational{_fps, 1};
+
+        // There is no AVCodecContext to copy from, so describe the elementary
+        // stream by hand. FLV insists on an AVCC AVCDecoderConfigurationRecord
+        // in extradata, which is exactly what MppEncoder::extradata() holds.
+        AVCodecParameters* par = _videoStream->codecpar;
+        par->codec_type = AVMEDIA_TYPE_VIDEO;
+        par->codec_id = AV_CODEC_ID_H264;
+        par->width = _mpp->width();
+        par->height = _mpp->height();
+        // Coded surface format; the NV12 <-> I420 distinction never reaches the
+        // container, so report what a decoder will hand out.
+        par->format = AV_PIX_FMT_YUV420P;
+        par->framerate = _videoStream->avg_frame_rate;
+
+        const std::vector<uint8_t>& extra = _mpp->extradata();
+        if (extra.empty()) {
+            LOG(ERROR) << "[RTMP] rkmpp produced no SPS/PPS extradata";
+            return false;
+        }
+        par->extradata = static_cast<uint8_t*>(
+            av_malloc(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+        if (!par->extradata) {
+            par->extradata_size = 0;
+            LOG(ERROR) << "[RTMP] Failed to allocate extradata";
+            return false;
+        }
+        memcpy(par->extradata, extra.data(), extra.size());
+        memset(par->extradata + extra.size(), 0, AV_INPUT_BUFFER_PADDING_SIZE);
+        par->extradata_size = static_cast<int>(extra.size());
+
+        LOG(INFO) << "[RTMP] Stream ready encode_ep=rkmpp " << par->width << "x" << par->height
+                  << "@" << _fps << "fps avcc_header=" << extra.size() << "B";
+        return true;
+    }
+#endif
+
+    _videoStream->time_base = _codecCtx->time_base;
+    _videoStream->avg_frame_rate = _codecCtx->framerate;
+
+    const int ret = avcodec_parameters_from_context(_videoStream->codecpar, _codecCtx);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        LOG(ERROR) << "[RTMP] Failed to copy codec parameters: " << errbuf;
+        return false;
+    }
+    return true;
+}
+
+bool RTMPEncoder::writeAvccPacket(const uint8_t* data, int size, int64_t frameIndex, bool key) {
+    if (!_outputCtx || !_videoStream || !_packet) {
+        return false;
+    }
+
+    int ret = av_new_packet(_packet, size);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        LOG(ERROR) << "[RTMP] Failed to allocate mux packet: " << errbuf;
+        return false;
+    }
+    memcpy(_packet->data, data, static_cast<size_t>(size));
+
+    // MppEncoder numbers frames in encode-order ticks of 1/fps; the muxer works
+    // in its own time_base (FLV rewrites it to 1/1000 during write_header).
+    const int64_t ts = av_rescale_q(frameIndex, AVRational{1, _fps}, _videoStream->time_base);
+    _packet->pts = ts;
+    _packet->dts = ts;  // VEPU and libx264 both run with no B frames
+    _packet->duration = av_rescale_q(1, AVRational{1, _fps}, _videoStream->time_base);
+    _packet->stream_index = _videoStream->index;
+    _packet->flags = key ? AV_PKT_FLAG_KEY : 0;
+
+    ret = av_interleaved_write_frame(_outputCtx, _packet);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        LOG(ERROR) << "[RTMP] Failed to write frame: " << errbuf;
+        av_packet_unref(_packet);
+        return false;
+    }
+    av_packet_unref(_packet);
+    return true;
+}
+
+#ifdef RUNTIME_WITH_MPP
+bool RTMPEncoder::openMppEncoder(const RtmpEncoderOptions& opts) {
+    std::string reason;
+    if (!runtime::mpp::MppEncoder::hostSupported(&reason)) {
+        LOG(INFO) << "[RTMP] rkmpp skipped: " << reason;
+        return false;
+    }
+
+    const int64_t bitRate = opts.bitRate > 0 ? opts.bitRate : defaultBitRate(_encWidth, _encHeight);
+    const int gop = opts.gopSize > 0 ? opts.gopSize : std::max(1, _fps * 2);
+
+    runtime::mpp::MppEncoder* enc = new runtime::mpp::MppEncoder();
+    if (!enc->open(_encWidth, _encHeight, _fps,
+                   static_cast<int>(std::min<int64_t>(bitRate, INT_MAX)), gop)) {
+        LOG(WARNING) << "[RTMP] VEPU open failed: " << enc->lastError();
+        delete enc;
+        return false;
+    }
+    _mpp = enc;
+
+    LOG(INFO) << "[RTMP] Using rkmpp (VEPU)"
+              << " " << _mpp->width() << "x" << _mpp->height()
+              << " stride=" << _mpp->horStride() << "x" << _mpp->verStride()
+              << " bitrate=" << (bitRate / 1000) << "k"
+              << " gop=" << gop << "@" << _fps << "fps";
+    return true;
+}
+
+bool RTMPEncoder::encodeAndPushMpp(const cv::Mat& frame) {
+    cv::Mat bgr = frame;
+    if (frame.cols != _srcWidth || frame.rows != _srcHeight) {
+        cv::resize(frame, bgr, cv::Size(_srcWidth, _srcHeight), 0, 0, cv::INTER_AREA);
+    }
+
+    // VEPU is asynchronous: it holds up to kInputSlots frames. Recycle eagerly so
+    // the common steady-state case never trips the "queue full" path below.
+    std::vector<runtime::mpp::MppEncPacket> packets;
+    _mpp->drain(&packets);
+
+    uint8_t* luma = _mpp->acquireInput();
+    if (!luma) {
+        LOG_EVERY_N(WARNING, 60) << "[RTMP] VEPU input queue full, frame dropped";
+        for (size_t i = 0; i < packets.size(); ++i) {
+            const runtime::mpp::MppEncPacket& pkt = packets[i];
+            writeAvccPacket(pkt.data.data(), static_cast<int>(pkt.data.size()), pkt.pts, pkt.key);
+        }
+        return false;
+    }
+    uint8_t* dstData[2] = {luma, _mpp->acquireInputChroma()};
+    const int stride = _mpp->horStride();
+    int dstLinesize[2] = {stride, stride};
+
+    const uint8_t* srcData[1] = {bgr.data};
+    int srcLinesize[1] = {static_cast<int>(bgr.step[0])};
+
+    if (sws_scale(_swsCtx, srcData, srcLinesize, 0, _srcHeight, dstData, dstLinesize) < 0) {
+        LOG(ERROR) << "[RTMP] Failed to convert BGR to NV12";
+        return false;
+    }
+
+    if (!_mpp->submit()) {
+        LOG(ERROR) << "[RTMP] VEPU submit failed: " << _mpp->lastError();
+        return false;
+    }
+    _frameIndex++;
+
+    _mpp->drain(&packets);
+    for (size_t i = 0; i < packets.size(); ++i) {
+        const runtime::mpp::MppEncPacket& pkt = packets[i];
+        if (pkt.data.empty()) continue;
+        if (!writeAvccPacket(pkt.data.data(), static_cast<int>(pkt.data.size()),
+                             pkt.pts, pkt.key)) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif  // RUNTIME_WITH_MPP
+
 bool RTMPEncoder::init(const std::string& rtmpUrl, int width, int height, int fps,
                        const RtmpEncoderOptions& opts) {
     if (_initialized) {
@@ -129,8 +310,21 @@ bool RTMPEncoder::init(const std::string& rtmpUrl, int width, int height, int fp
     _fps = fps > 0 ? fps : 25;
     _encodeEp = "none";
 
-    const bool tryNvenc = opts.preferHw && !opts.forceSoft;
-    if (tryNvenc) {
+    const std::string family = opts.hwaccel.empty() ? std::string("auto") : opts.hwaccel;
+    const bool wantHw = opts.preferHw && !opts.forceSoft && family != "none";
+    const bool tryNvenc = wantHw && (family == "auto" || family == "cuda");
+    // Stays false in a build without the MPP backend, so hwaccel=rkmpp there
+    // correctly degrades to the software path below.
+    bool tryRkmpp = false;
+#ifdef RUNTIME_WITH_MPP
+    tryRkmpp = wantHw && (family == "auto" || family == "rkmpp");
+#endif
+    if (wantHw && !tryRkmpp && !tryNvenc) {
+        LOG(WARNING) << "[RTMP] hwaccel=" << family << " unusable here, using software encode";
+    }
+
+    if (wantHw) {
+        // Both hardware encoders want an aligned picture; libx264 copes with odd sizes.
         _encWidth = alignDim(width);
         _encHeight = alignDim(height);
     } else {
@@ -141,6 +335,7 @@ bool RTMPEncoder::init(const std::string& rtmpUrl, int width, int height, int fp
     LOG(INFO) << "[RTMP] Initializing encoder: " << rtmpUrl
               << " (" << width << "x" << height << " -> " << _encWidth << "x" << _encHeight
               << "@" << _fps << "fps)"
+              << " hwaccel=" << family
               << " prefer_hw=" << (opts.preferHw ? "true" : "false")
               << " force_soft=" << (opts.forceSoft ? "true" : "false")
               << " bitrate_hint=" << (opts.bitRate > 0 ? opts.bitRate / 1000 : 0) << "k";
@@ -154,7 +349,20 @@ bool RTMPEncoder::init(const std::string& rtmpUrl, int width, int height, int fp
     }
 
     bool opened = false;
-    if (tryNvenc) {
+#ifdef RUNTIME_WITH_MPP
+    if (tryRkmpp) {
+        if (openMppEncoder(opts)) {
+            _encodeEp = "rkmpp";
+            opened = true;
+        } else {
+            LOG(WARNING) << "[RTMP] rkmpp (VEPU) unavailable, falling back to FFmpeg encode";
+            _encWidth = width;
+            _encHeight = height;
+        }
+    }
+#endif
+
+    if (!opened && tryNvenc) {
         const AVCodec* nvenc = avcodec_find_encoder_by_name("h264_nvenc");
         if (nvenc) {
             if (openEncoder(nvenc, true, opts)) {
@@ -164,11 +372,11 @@ bool RTMPEncoder::init(const std::string& rtmpUrl, int width, int height, int fp
                           << " gpu=" << opts.gpuDeviceId;
             } else {
                 LOG(WARNING) << "[RTMP] h264_nvenc open failed, falling back to libx264";
-                _encWidth = width;
-                _encHeight = height;
             }
         } else {
             LOG(INFO) << "[RTMP] h264_nvenc not found in FFmpeg, using libx264";
+        }
+        if (!opened) {
             _encWidth = width;
             _encHeight = height;
         }
@@ -192,21 +400,7 @@ bool RTMPEncoder::init(const std::string& rtmpUrl, int width, int height, int fp
         _encodeEp = "libx264";
     }
 
-    _videoStream = avformat_new_stream(_outputCtx, nullptr);
-    if (!_videoStream) {
-        LOG(ERROR) << "[RTMP] Failed to create video stream";
-        release();
-        return false;
-    }
-
-    _videoStream->time_base = _codecCtx->time_base;
-    _videoStream->avg_frame_rate = _codecCtx->framerate;
-
-    ret = avcodec_parameters_from_context(_videoStream->codecpar, _codecCtx);
-    if (ret < 0) {
-        char errbuf[AV_ERROR_MAX_STRING_SIZE];
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        LOG(ERROR) << "[RTMP] Failed to copy codec parameters: " << errbuf;
+    if (!setupVideoStream()) {
         release();
         return false;
     }
@@ -244,10 +438,14 @@ bool RTMPEncoder::init(const std::string& rtmpUrl, int width, int height, int fp
         return false;
     }
 
-    // BGR -> YUV420P；NVENC 16 对齐偶发缩放时用 bicubic，比 bilinear 更锐
+    // BGR -> YUV；NVENC 16 对齐偶发缩放时用 bicubic，比 bilinear 更锐。
+    // VEPU 只吃 NV12（半平面），且目标行距是它自己算出的 hor_stride，
+    // 所以 rkmpp 路径下 dst 平面每帧从 MppBuffer 现取，见 encodeAndPushMpp()。
+    const AVPixelFormat dstFmt = (_encodeEp == "rkmpp") ? AV_PIX_FMT_NV12
+                                                        : AV_PIX_FMT_YUV420P;
     _swsCtx = sws_getContext(
         _srcWidth, _srcHeight, AV_PIX_FMT_BGR24,
-        _encWidth, _encHeight, AV_PIX_FMT_YUV420P,
+        _encWidth, _encHeight, dstFmt,
         SWS_BICUBIC, nullptr, nullptr, nullptr
     );
     if (!_swsCtx) {
@@ -256,24 +454,26 @@ bool RTMPEncoder::init(const std::string& rtmpUrl, int width, int height, int fp
         return false;
     }
 
-    _yuvFrame = av_frame_alloc();
-    if (!_yuvFrame) {
-        LOG(ERROR) << "[RTMP] Failed to allocate YUV frame";
-        release();
-        return false;
-    }
+    if (!_mpp) {
+        _yuvFrame = av_frame_alloc();
+        if (!_yuvFrame) {
+            LOG(ERROR) << "[RTMP] Failed to allocate YUV frame";
+            release();
+            return false;
+        }
 
-    _yuvFrame->format = AV_PIX_FMT_YUV420P;
-    _yuvFrame->width = _encWidth;
-    _yuvFrame->height = _encHeight;
+        _yuvFrame->format = dstFmt;
+        _yuvFrame->width = _encWidth;
+        _yuvFrame->height = _encHeight;
 
-    ret = av_frame_get_buffer(_yuvFrame, 0);
-    if (ret < 0) {
-        char errbuf[AV_ERROR_MAX_STRING_SIZE];
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        LOG(ERROR) << "[RTMP] Failed to allocate frame buffer: " << errbuf;
-        release();
-        return false;
+        ret = av_frame_get_buffer(_yuvFrame, 0);
+        if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            LOG(ERROR) << "[RTMP] Failed to allocate frame buffer: " << errbuf;
+            release();
+            return false;
+        }
     }
 
     _packet = av_packet_alloc();
@@ -301,6 +501,12 @@ bool RTMPEncoder::encodeAndPush(const cv::Mat& frame) {
         LOG(WARNING) << "[RTMP] Empty frame received";
         return false;
     }
+
+#ifdef RUNTIME_WITH_MPP
+    if (_mpp) {
+        return encodeAndPushMpp(frame);
+    }
+#endif
 
     cv::Mat bgr = frame;
     if (frame.cols != _srcWidth || frame.rows != _srcHeight) {
@@ -365,6 +571,31 @@ void RTMPEncoder::release() {
     }
 
     LOG(INFO) << "[RTMP] Releasing encoder resources encode_ep=" << _encodeEp;
+
+#ifdef RUNTIME_WITH_MPP
+    if (_mpp) {
+        // VEPU holds the last few frames in flight; push EOS and collect them
+        // before the trailer, otherwise the stream ends short.
+        std::vector<runtime::mpp::MppEncPacket> tail;
+        bool drained = false;
+        for (int guard = 0; guard < 64 && !drained; ++guard) {
+            drained = _mpp->flush(&tail);
+        }
+        if (_initialized && _outputCtx && _videoStream) {
+            for (size_t i = 0; i < tail.size(); ++i) {
+                const runtime::mpp::MppEncPacket& pkt = tail[i];
+                if (pkt.data.empty()) continue;
+                writeAvccPacket(pkt.data.data(), static_cast<int>(pkt.data.size()),
+                                pkt.pts, pkt.key);
+            }
+        }
+        if (!drained) {
+            LOG(WARNING) << "[RTMP] VEPU flush incomplete, pending=" << _mpp->freeInputSlots();
+        }
+        delete _mpp;
+        _mpp = nullptr;
+    }
+#endif
 
     if (_codecCtx && _initialized) {
         avcodec_send_frame(_codecCtx, nullptr);

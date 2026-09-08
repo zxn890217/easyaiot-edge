@@ -615,26 +615,46 @@ export RUNTIME_PYTHON=/path/to/python   # 需已装 ultralytics
   - `gpu_device_id` / `RUNTIME_GPU_DEVICE_ID` 或 `CUDA_VISIBLE_DEVICES`
 - 日志会出现 `Using CUDA EP` 或 `Using CPU execution (fallback)`；`GET /health` 含 `infer_ep=cuda|cpu`、`model_layout`。
 
-### 硬解 / 硬编（NVIDIA，realtime）
+### 硬解 / 硬编（NVIDIA / Rockchip，realtime）
 
-- **硬解**：FFmpeg CUDA hwdevice（NVDEC）→ `av_hwframe_transfer_data` 到主机内存 → `sws` 成 BGR → 现有推理/画框。
-- **硬编**：RTMP 推流优先 `h264_nvenc`（分辨率 16 对齐，`preset` 默认 `p3`），失败回退 `libx264`。
+- **硬解**：FFmpeg 后端硬件解码（NVDEC / rkvdec）→ `av_hwframe_transfer_data` 到主机内存 → `sws` 成 BGR → 现有推理/画框。
+- **硬编**：RTMP 推流优先硬件编码器（`h264_nvenc` / `h264_rkmpp`；分辨率 16 对齐，NVENC `preset` 默认 `p3`），失败回退 `libx264`。
 - 配置（`[ai]` / 环境变量）：
 
 | 字段 / 环境变量 | 默认 | 含义 |
 |-----------------|------|------|
-| `prefer_hwaccel` / `RUNTIME_PREFER_HWACCEL` | `true` | 优先硬解+硬编 |
-| `force_soft_av` / `RUNTIME_FORCE_SOFT_AV` | `false` | 强制软解软编 |
-| `hwaccel_device_id` | 同 `gpu_device_id` | CUDA 设备 |
+| `hwaccel` / `RUNTIME_HWACCEL` | `auto` | 编解码后端：`auto` / `cuda` / `rkmpp` / `none` |
+| `hwaccel_decode` / `RUNTIME_HWACCEL_DECODE` | `true` | 硬件解码分项开关（失败自动回落软解） |
+| `hwaccel_encode` / `RUNTIME_HWACCEL_ENCODE` | `true` | 硬件编码分项开关（失败自动回落 `libx264`） |
+| `prefer_hwaccel` / `RUNTIME_PREFER_HWACCEL` | `true` | 硬解+硬编总开关 |
+| `force_soft_av` / `RUNTIME_FORCE_SOFT_AV` | `false` | 强制软解软编（唯一 kill switch） |
+| `hwaccel_device_id` | 同 `gpu_device_id` | CUDA 设备（rkmpp 忽略） |
 | `nvenc_preset` / `RUNTIME_NVENC_PRESET` | `p3` | NVENC preset（对齐 VIDEO） |
 | `bitrate` / `RUNTIME_VIDEO_BITRATE`（或 `FFMPEG_VIDEO_BITRATE`） | 按分辨率自动 | RTMP 重编码 ABR；1080p 默认约 `4500k`（旧版写死 `2500k` 易发糊） |
 | `gop` / `RUNTIME_GOP_SIZE`（或 `FFMPEG_GOP_SIZE`） | `2 * fps` | 关键帧间隔；过短会浪费码率、画面更糊 |
 
-- `prefer_gpu=false` 或 `force_cpu=true` 时会同步 `force_soft_av`，避免 CPU 任务抢 NVENC。
+- `prefer_gpu` / `force_cpu` **只决定 ONNX Runtime 的设备**，不再联动编解码：RK3588 上没有 CUDA 设备，若沿用旧耦合会把 rkvdec/VEPU 一起关掉，`libx264` 白吃 30-40 % CPU。要单独关编解码硬件请用 `force_soft_av=true`。
 - 硬解连续 `transfer` 失败会在本会话降级软解；硬编 open 失败用 `libx264`，任务不中断。
-- `GET /health` 增加 `decode_ep=cuda|cpu`、`encode_ep=h264_nvenc|libx264|none`。
+- `GET /health` 增加 `decode_ep=cuda|rkmpp|cpu`、`encode_ep=h264_nvenc|h264_rkmpp|libx264|none`。
+- **RK3588（rkmpp）**：需 `-DRUNTIME_WITH_MPP=ON` 构建，运行期依赖 `/dev/mpp_service`、`/dev/rga`、`/dev/dma_heap/*`，且 `librockchip_mpp` 是**链接期**依赖（解析不到 RUNTIME 直接起不来，不会回落软解）。盒子上的部署/校验用 `./install_rk3588.sh mpp-setup` 与 `doctor`，详见根目录 `install_rk3588.sh` 头部说明。
 - **snap/patrol** 仍走 OpenCV `VideoCapture`（本轮无硬解硬编）。
-- **本轮不做**：TensorRT EP、VAAPI/QSV、GPU 零拷贝贯通。
+- **本轮不做**：TensorRT EP、VAAPI/QSV、GPU 零拷贝贯通（rkmpp 侧已做 NV12 DMABUF 零拷贝，CUDA 侧仍有一次 transfer）。
+
+### RK3588 自检脚本（NPU 判据 + 编解码链路）
+
+`./install_rk3588.sh verify` 只回答「整条链路通不通」；要按判据逐条取证用 [`RUNTIME/scripts/verify_rk_media.sh`](scripts/verify_rk_media.sh)：
+
+```bash
+bash RUNTIME/scripts/verify_rk_media.sh                             # 宿主全量（含 rknn_init / mpp_enc_probe 实跑）
+bash RUNTIME/scripts/verify_rk_media.sh --no-probe                  # 只做静态判据交叉校验（x86 开发机可长跑）
+bash RUNTIME/scripts/verify_rk_media.sh --container=video-service   # 拷进容器复跑，并与宿主比对
+```
+
+退出码 `0 = 无 FAIL（允许 SKIP）`、`1 = 有 FAIL`；机器可读摘要默认落在 `${TMPDIR:-/tmp}/rk_media_report.env`。三段判据：
+
+- **A1–A7**：交叉校验 shell（`VIDEO/scripts/npu_drm_nodes.sh`）、Python 控制面（`runtime_config_service.py`）、C++（`src/InferEngine.cpp`）三处 NPU 探测是否同源，外加一份读 `/sys/class/drm` 的独立 oracle 抓漂移；核对判据里没混进 `/dev/rga`、`renderD*`，以及探到的 RKNPU card 主节点是否真进了 compose 的 `devices:` 白名单。
+- **B1–B8**：`librockchip_mpp` 定位 / SONAME / GLIBC 2.29 版本节点 / `dlopen` 实证；`/dev/mpp_service` + `/dev/dma_heap/*` + `ulimit -l`；RUNTIME 二进制的 `DT_NEEDED` 与 `ldd`；逐份 `config/task_*.ini` 的 `hwaccel*` / `force_soft_av` 一致性；真编一帧 H.264 校验起始码与 NAL 类型；`GET /health` 的 `decode_ep` / `encode_ep`。
+- **C 段**：容器内复跑同一套判据，比对 9 个字段并读 cgroup 的 `devices.list`（`c 226:* rwm`）—— 宿主通过、容器不通时看这一段。
 
 安装侧：检测到 `nvidia-smi` 时优先下载 **GPU ORT** 包（如 `onnxruntime-linux-x64-gpu-*`），写入 `deploy.env` 的 CUDA lib 路径；无 GPU / 下载失败则用 CPU 包并告警。硬解硬编还依赖本机 FFmpeg 是否编入 CUDA/`h264_nvenc`（conda 栈通常具备）。
 
@@ -651,9 +671,13 @@ export RUNTIME_PYTHON=/path/to/python   # 需已装 ultralytics
 | realtime 无带框预览 | 确认任务为 `executor=cpp` + `realtime`，ini 中 `enable_rtmp=true` 且 `rtmp_url` 为独立 `ai/` 路径（不要写成 `live/`） |
 | 只有告警没有画面 | 抓拍/巡检默认不以长推流为主；看结构化告警即可。需要画面时给 realtime 或显式配置 `ai_rtmp` |
 | `/health` 显示 `infer_ep=cpu` | 正常回退；检查驱动、`nvidia-smi`、ORT GPU 包与 `LD_LIBRARY_PATH` |
+| RK3588 上 `infer_ep` 不是 `rknn` | 启动日志会写明 `[INFER] librknnrt.so is not loadable` 或 `no NPU device node was found`。NPU 证据只有 `/dev/rknpu*`、`*.npu` devfreq 目录和 **RKNPU 的 `/dev/dri/cardN` 主节点**（实测 `card1`）—— `/dev/rga`、`renderD*` 不算，别让 compose 只透传 render 节点。具体哪一处判据跑偏用 `bash RUNTIME/scripts/verify_rk_media.sh`（A1–A7） |
+| 有告警阈值但 RKNN 任务完全无框、日志也没报错 | 旧版本 `RknnEngine::Run` 在未就绪时静默 `return -1`；现在会限频打印 `[RKNN] Run skipped - engine not ready`，根因看日志里更早的 `[RKNN]` 加载失败行 |
 | cpp 任务没用上自定义模型 | 确认目录有 `.onnx`，或本机可跑 `ensure_onnx_model.py` 从 `.pt` 导出；看 VIDEO 日志 `RUNTIME model export` |
 | YOLO26 框异常 | `/health` 应显示 `model_layout=end2end`；否则导出的不是 end2end ONNX |
 | `/health` 显示 `decode_ep=cpu` / `encode_ep=libx264` | 无 NVIDIA、FFmpeg 无 CUDA/nvenc，或 `force_soft_av=true`；属正常回退 |
+| RK3588 上 `decode_ep` 仍是 `cpu` | 依次确认：RUNTIME 是否 `-DRUNTIME_WITH_MPP=ON` 构建（`ldd` 有 `librockchip_mpp`）、`/dev/mpp_service`+`/dev/dma_heap/*` 是否可访问、ini `[ai] hwaccel` 是否被写成 `none`；启动日志 `MppEnv` 会给出 buffer group 探测结果。这几条 `bash RUNTIME/scripts/verify_rk_media.sh` 的 B1/B4/B6/B7 会逐项给出结论 |
+| RUNTIME 在 RK3588 容器内起不来（127 / `version GLIBC_2.29' not found`） | `librockchip_mpp` 是链接期依赖，必须用 `./install_rk3588.sh mpp-setup` 打过版本节点的 `RUNTIME/.mpp-sdk/lib` 那份，别挂宿主 `/usr/lib`；容器内是否真拿到打过补丁的那份用 `bash RUNTIME/scripts/verify_rk_media.sh --container=video-service`（C 段比对宿主与容器的 `mpp_lib`/`mpp_dlopen`） |
 | 本地 mp4/文件播完后任务结束 | 有限媒体（裸路径 / `file://`）遇 EOF **干净退出**，不再狂重连；直播 RTSP/UDP 仍会退避重连 |
 | `control_port` 变成 8000 | 端口必须在 **8000–9000**（与 VIDEO 一致）；越界会 ERROR 日志并回退 8000 |
 | MQTT 未通 | 检查 `MQTT_BROKER_URLS` / ini `[mqtt]`；iot-sink 须订阅 `mqtt/iot-*` |

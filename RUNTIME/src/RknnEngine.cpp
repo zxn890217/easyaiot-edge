@@ -378,6 +378,16 @@ int RknnEngine::LoadModel(const std::string& model_path,
 int RknnEngine::Run(cv::Mat& image, std::vector<DetectObject>& detections) {
     detections.clear();
     if (!ready_ || !impl_->ctx) {
+        // Rate limited: the pipeline keeps pulling frames after a load failure, so an
+        // unthrottled log here buries the real "why" from LoadModel() on a 25 fps stream.
+        static int not_ready_count = 0;
+        if (not_ready_count < 3) {
+            LOG(ERROR) << "[RKNN] Run skipped - engine not ready (ready=" << ready_
+                       << " ctx=" << (impl_->ctx ? "ok" : "null") << ") infer_ep=" << inferEp_
+                       << "; see the [RKNN] LoadModel error above"
+                       << (not_ready_count == 2 ? " (further messages suppressed)" : "");
+            not_ready_count++;
+        }
         return -1;
     }
 

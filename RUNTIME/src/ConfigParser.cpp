@@ -245,6 +245,12 @@ bool ConfigParser::parse(const std::string& filename, Config& config) {
                 config.inferBackend = trim(value);
             } else if (key == "npu_core_mask") {
                 config.npuCoreMask = parseNpuCoreMask(value);
+            } else if (key == "hwaccel") {
+                config.hwaccel = lowerTrim(value);
+            } else if (key == "hwaccel_decode") {
+                config.hwaccelDecode = parseBool(value);
+            } else if (key == "hwaccel_encode") {
+                config.hwaccelEncode = parseBool(value);
             } else if (key == "prefer_hwaccel") {
                 config.preferHwaccel = parseBool(value);
             } else if (key == "force_soft_av") {
@@ -532,6 +538,16 @@ bool ConfigParser::parse(const std::string& filename, Config& config) {
     if (config.hwaccelDeviceId < 0) {
         config.hwaccelDeviceId = config.gpuDeviceId;
     }
+    if (const char* v = std::getenv("RUNTIME_HWACCEL")) {
+        const std::string s = lowerTrim(v);
+        if (!s.empty()) config.hwaccel = s;
+    }
+    if (const char* v = std::getenv("RUNTIME_HWACCEL_DECODE")) {
+        config.hwaccelDecode = parseBool(v);
+    }
+    if (const char* v = std::getenv("RUNTIME_HWACCEL_ENCODE")) {
+        config.hwaccelEncode = parseBool(v);
+    }
     if (const char* v = std::getenv("RUNTIME_FORCE_SOFT_AV")) {
         if (parseBool(v)) {
             config.forceSoftAv = true;
@@ -563,10 +579,13 @@ bool ConfigParser::parse(const std::string& filename, Config& config) {
         int g = parseInt(v);
         if (g > 0) config.videoGopSize = g;
     }
-    // No GPU for inference → also avoid NVDEC/NVENC contention on CPU-only tasks
-    if (config.forceCpu || !config.preferGpu) {
-        config.forceSoftAv = true;
-        config.preferHwaccel = false;
+    // prefer_gpu / force_cpu steer ONNX Runtime only. They must NOT disable the
+    // video codec hardware: on RK3588 there is no CUDA device at all, so the old
+    // coupling silently pinned every stream to rkvdec-off + libx264-on, which is
+    // where 30-40 % of the CPU went. force_soft_av stays as the explicit kill
+    // switch for both codec paths.
+    if (config.hwaccel.empty()) {
+        config.hwaccel = "auto";
     }
     if (config.forceSoftAv) {
         config.preferHwaccel = false;
@@ -577,8 +596,11 @@ bool ConfigParser::parse(const std::string& filename, Config& config) {
               << " prefer_gpu=" << (config.preferGpu ? "true" : "false")
               << " force_cpu=" << (config.forceCpu ? "true" : "false")
               << " gpu_device_id=" << config.gpuDeviceId
+              << " hwaccel=" << (config.hwaccel.empty() ? "auto" : config.hwaccel)
               << " prefer_hwaccel=" << (config.preferHwaccel ? "true" : "false")
               << " force_soft_av=" << (config.forceSoftAv ? "true" : "false")
+              << " hwaccel_decode=" << (hwaccelDecodeEnabled(config) ? "true" : "false")
+              << " hwaccel_encode=" << (hwaccelEncodeEnabled(config) ? "true" : "false")
               << " hwaccel_device_id=" << config.hwaccelDeviceId
               << " nvenc_preset=" << config.nvencPreset
               << " video_bitrate=" << (config.videoBitRate > 0 ? config.videoBitRate / 1000 : 0) << "k"

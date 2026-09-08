@@ -92,11 +92,34 @@ typedef struct Config {
      */
     int npuCoreMask{0};
 
-    // FFmpeg NVDEC/NVENC (NVIDIA); soft fallback on failure
+    /**
+     * Hardware codec family: auto | cuda | rkmpp | none.
+     * auto lets each backend probe the board (NVDEC/NVENC vs rkvdec/VEPU).
+     * This is deliberately independent from prefer_gpu / force_cpu, which only
+     * steer ONNX Runtime: an RK3588 box has no CUDA device yet still needs the
+     * VPU for decode and encode, otherwise libx264 eats 30-40 % of the CPU.
+     */
+    std::string hwaccel{"auto"};
+    /** Hardware decode (NVDEC / rkvdec). Soft fallback on failure. */
+    bool hwaccelDecode{true};
+    /** Hardware encode (NVENC / VEPU). libx264 fallback on failure. */
+    bool hwaccelEncode{true};
+
+    // Master switch and kill switch for both of the above
     bool preferHwaccel{true};
     bool forceSoftAv{false};
-    int hwaccelDeviceId{-1};  // <0 → use gpuDeviceId after parse
+    int hwaccelDeviceId{-1};  // <0 → use gpuDeviceId after parse (CUDA only)
     std::string nvencPreset{"p3"};
 } Config;
+
+/** Effective hardware decode request after the master / kill switches. */
+inline bool hwaccelDecodeEnabled(const Config& c) {
+    return c.preferHwaccel && !c.forceSoftAv && c.hwaccelDecode && c.hwaccel != "none";
+}
+
+/** Effective hardware encode request after the master / kill switches. */
+inline bool hwaccelEncodeEnabled(const Config& c) {
+    return c.preferHwaccel && !c.forceSoftAv && c.hwaccelEncode && c.hwaccel != "none";
+}
 
 #endif //CONFIG_H

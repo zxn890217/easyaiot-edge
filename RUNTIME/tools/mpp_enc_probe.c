@@ -1,7 +1,14 @@
 // mpp_enc_probe.c -- RK3588 hardware H.264 encode feasibility probe (stage 1 + 2).
 //
 //   gcc -O2 -I/usr/include/rockchip mpp_enc_probe.c -o mpp_enc_probe \
-//       -L/usr/lib/aarch64-linux-gnu -l:librockchip_mpp.so.0
+//       -L/usr/lib/aarch64-linux-gnu -l:librockchip_mpp.so.0 \
+//       -Werror=int-conversion -Werror=implicit-function-declaration
+//
+//   The two -Werror flags are not decoration. MPP's buffer API is mostly macros
+//   over _with_tag / _with_caller functions, so a swapped argument list (the
+//   macro takes (group, buffer, size) while the function takes
+//   (group, buffer, size, tag, caller, line)) only warns on the default gcc
+//   settings and then silently hands VEPU a bogus pointer.
 //   ./mpp_enc_probe          # stage 1: context capability
 //   ./mpp_enc_probe encode   # stage 2: real one-frame encode through VEPU
 //   ./mpp_enc_probe encode /tmp/mpp/out.264
@@ -316,7 +323,11 @@ static int stage2(const char *outPath) {
     // ---- 4. one synthetic NV12 frame in, bitstream out.
     {
         MppBuffer inBuf = NULL;
-        if (mpp_buffer_get(grp, frameSize, &inBuf) || !inBuf) {
+        // Macro shape on this board is mpp_buffer_get(group, buffer, size) --
+        // buffer BEFORE size (it forwards to mpp_buffer_get_with_tag(group,
+        // MppBuffer*, size_t, ...)). Getting this backwards compiles with only
+        // -Wint-conversion warnings and then feeds VEPU a garbage buffer.
+        if (mpp_buffer_get(grp, &inBuf, frameSize) || !inBuf) {
             printf("mpp_buffer_get(%zu) failed\n", frameSize);
             rcFail = 1;
             goto out_cfg;
@@ -352,45 +363,84 @@ static int stage2(const char *outPath) {
         mpp_frame_set_buffer(frame, inBuf);
         mpp_frame_set_eos(frame, 0);
 
-        // VEPU needs a pipeline fill; push frames until packets start coming
-        // back, then keep going so we collect an actual sequence.
+        // With MppBufferGroup on DRM the payload must be a real dmabuf, so the
+        // fd is the thing VEPU actually consumes. A -1 here would explain a
+        // rejected submit far better than any config key would.
+        printf("input buffer: ptr=%p fd=%d size=%zu\n", (void *)px,
+               mpp_buffer_get_fd(inBuf), frameSize);
+
+        // Split put/get port API. The combined single-shot mpi->encode(ctx,
+        // frame, NULL) is rejected by this MPP vintage ("mpi_encode found NULL
+        // input frame ... packet (nil)", rc=-3) because it insists on a
+        // caller-owned output packet, so it is not exercised here.
         FILE *of = fopen(outPath, "wb");
         printf("output file: %s (%s)\n", outPath, of ? "open ok" : strerror(errno));
         size_t total = 0;
-        int framesIn = 0, pkts = 0;
-        for (int attempt = 0; attempt < 12 && pkts < 6; ++attempt) {
-            mpp_frame_set_pts(frame, (MppPts)framesIn);
-            ret = mpi->encode(ctx, frame, NULL);
-            if (ret) {
-                printf("  encode_put #%d rc=%d\n", attempt, ret);
-                fflush(stdout);
-                break;
-            }
-            ++framesIn;
-            MppPacket op = NULL;
-            if (mpi->encode_get_packet(ctx, &op)) {
-                printf("  encode_get_packet #%d failed\n", attempt);
-                break;
-            }
-            if (op) {
-                size_t len = mpp_packet_get_length(op);
-                unsigned char *dat = (unsigned char *)mpp_packet_get_data(op);
-                total += len;
-                ++pkts;
-                printf("  pkt#%d len=%zu %s\n", pkts, len,
-                       (len > 4) ? "<== BITSTREAM" : "(empty)");
-                if (len > 4 && dat) {
-                    dumpNals(dat, len, "pkt");
-                    if (of) {
-                        fwrite(dat, 1, len, of);
-                    }
-                }
-                if (pkts == 1) {
+        int framesIn = 0, pkts = 0, drain = 0;
+        int putErr = 0, getErr = 0;
+        const int FEED = 4;   // one IDR is enough for a feasibility verdict
+
+        for (;;) {
+            if (framesIn < FEED) {
+                mpp_frame_set_pts(frame, (RK_S64)framesIn);
+                mpp_frame_set_eos(frame, 0);
+                ret = mpi->encode_put_frame(ctx, frame);
+                if (ret) {
+                    putErr = ret;
+                    printf("  encode_put_frame #%d rc=%d\n", framesIn, ret);
                     fflush(stdout);
+                    break;
                 }
-                mpp_packet_deinit(&op);
+                ++framesIn;
+            } else if (!drain) {
+                // EOS goes through a NULL frame on the put port, never through
+                // a frame with the eos bit set on a real buffer.
+                MppFrame eos = NULL;
+                drain = 1;
+                ret = mpi->encode_put_frame(ctx, eos);
+                printf("  put eos rc=%d\n", ret);
+                if (ret) {
+                    putErr = ret;
+                    fflush(stdout);
+                    break;
+                }
+            }
+
+            MppPacket op = NULL;
+            ret = mpi->encode_get_packet(ctx, &op);
+            if (ret) {
+                getErr = ret;
+                printf("  encode_get_packet rc=%d\n", ret);
+                break;
+            }
+            if (!op) {
+                if (framesIn >= FEED && drain) {
+                    break;
+                }
+                continue;   // pipeline still filling; keep feeding
+            }
+            size_t len = mpp_packet_get_length(op);
+            unsigned char *dat = (unsigned char *)mpp_packet_get_data(op);
+            total += len;
+            ++pkts;
+            printf("  pkt#%d len=%zu %s\n", pkts, len,
+                   (len > 4) ? "<== BITSTREAM" : "(empty)");
+            if (len > 4 && dat) {
+                dumpNals(dat, len, "pkt");
+                if (of) {
+                    fwrite(dat, 1, len, of);
+                }
+            }
+            mpp_packet_deinit(&op);
+            if (pkts >= 6) {
+                break;
+            }
+            if (framesIn >= FEED && drain) {
+                break;
             }
         }
+        printf("  loop exit: frames_in=%d pkts=%d putErr=%d getErr=%d\n", framesIn,
+               pkts, putErr, getErr);
         if (of) {
             fclose(of);
         }
@@ -402,7 +452,19 @@ static int stage2(const char *outPath) {
         if (pkts > 0 && total > 100) {
             printf("VEPU HARDWARE H.264 ENCODER PRODUCES A REAL BITSTREAM\n");
         } else {
-            printf("no bitstream produced -> direct-MPP backend is NOT viable\n");
+            // Distinguishing "submit rejected" from "hardware produced nothing"
+            // matters: the first is still an API-shape problem we can fix, the
+            // second would kill the whole direct-MPP route.
+            if (putErr) {
+                printf("encode_put_frame REJECTED (rc=%d) -> API usage still wrong, "
+                       "not yet proof the VEPU cannot encode\n", putErr);
+            } else if (getErr) {
+                printf("encode_get_packet errored (rc=%d) while frames were accepted\n",
+                       getErr);
+            } else {
+                printf("frames accepted but no bitstream came back\n");
+            }
+            printf("-> direct-MPP backend NOT proven viable\n");
             rcFail = 1;
         }
         fflush(stdout);

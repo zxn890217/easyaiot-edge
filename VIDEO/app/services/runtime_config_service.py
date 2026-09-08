@@ -10,6 +10,7 @@ EASYAIOT_RUNTIME_SKIP=1 关闭）。容器内不自动编译（期望宿主机�
 """
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -478,15 +479,18 @@ def _ensure_rknn_script() -> Path:
     return _repo_root() / 'RUNTIME' / 'scripts' / 'ensure_rknn_model.py'
 
 
-#: 与 RUNTIME/src/InferEngine.cpp 的 hostHasRknn() 保持一致的 NPU 节点探测清单
+#: 与 RUNTIME/src/InferEngine.cpp 的 hostHasRknn() 保持一致的 NPU 节点探测清单。
+#: /dev/rga 与 /dev/dri/renderD* 不属于这里：前者是 2D 加速器，后者归 rockchip-drm
+#: 显示卡，两者在只启用 rkmpp 硬解的容器里也一定存在。把它们当 NPU 证据会让控制面
+#: 误判「本机有 NPU」，于是只下发 .rknn 权重，而 RUNTIME 里 rknn_init 必然失败。
 _NPU_DEVICE_NODES = (
-    '/dev/rga',
     '/dev/rknpu',
-    '/dev/mpp_service',
-    '/dev/dri',
+    '/dev/rknpu_ll',
     '/sys/class/devfreq/fdab0000.npu',
     '/sys/class/devfreq/ff800000.npu',
 )
+#: RKNPU 的 DRM card 主节点判据（VIDEO/scripts/npu_drm_nodes.sh 同源）
+_NPU_SYSFS_RE = re.compile(r'(rknpu|rknn|\.npu|/npu)')
 _RKNNRT_LIB_CANDIDATES = (
     '/usr/lib/librknnrt.so',
     '/usr/local/lib/librknnrt.so',
@@ -499,13 +503,41 @@ _RKNNRT_LIB_CANDIDATES = (
 )
 
 
+def npu_drm_card_nodes() -> tuple:
+    """返回 RKNPU 驱动所占的 /dev/dri/cardN（RK3588 上 rknn_init 用的就是它）。"""
+    nodes = []
+    drm_root = '/sys/class/drm'
+    try:
+        entries = os.listdir(drm_root)
+    except OSError:
+        return ()
+    for name in entries:
+        if not re.fullmatch(r'card(\d+)', name):
+            continue
+        sysfs = os.path.join(drm_root, name)
+        try:
+            driver = os.path.basename(os.path.realpath(os.path.join(sysfs, 'device', 'driver')))
+            devpath = os.path.realpath(sysfs)
+        except OSError:
+            continue
+        # 驱动名与 sysfs 路径都看：厂商内核登记成 rknpu / rockchip-rknpu，
+        # 平台路径里通常带 fe440000.npu；rockchip-drm 两者都不匹配。
+        if not _NPU_SYSFS_RE.search(f'{driver} {devpath}'.lower()):
+            continue
+        node = os.path.join('/dev/dri', name)
+        if os.path.exists(node):
+            nodes.append(node)
+    return tuple(sorted(set(nodes)))
+
+
 @lru_cache(maxsize=1)
 def rknn_host_available() -> bool:
     """本机（控制面与 RUNTIME 同机部署时）是否具备 Rockchip NPU 运行时。"""
     if platform.machine().lower() not in ('aarch64', 'arm64', 'armv8l'):
         return False
     if not any(os.path.exists(node) for node in _NPU_DEVICE_NODES):
-        return False
+        if not npu_drm_card_nodes():
+            return False
     if any(os.path.isfile(lib) for lib in _RKNNRT_LIB_CANDIDATES):
         return True
     try:
@@ -537,6 +569,70 @@ def resolve_npu_core_mask() -> str:
     """写入 ini `[ai] npu_core_mask` 的取值（auto | all | per_thread | coreN | 数字掩码）。"""
     raw = (os.getenv('RUNTIME_NPU_CORE_MASK') or os.getenv('NPU_CORE_MASK') or 'auto').strip()
     return raw or 'auto'
+
+
+#: [ai] hwaccel 的合法取值，与 RUNTIME/src/Config.h 的 hwaccel 字段一致
+_HWACCEL_VALUES = ('auto', 'cuda', 'rkmpp', 'none')
+_HWACCEL_ALIASES = {
+    'cuda': 'cuda', 'nvenc': 'cuda', 'nvidia': 'cuda', 'cuvid': 'cuda',
+    'rkmpp': 'rkmpp', 'rockchip': 'rkmpp', 'rk3588': 'rkmpp',
+    'rkvdec': 'rkmpp', 'vepu': 'rkmpp', 'mpp': 'rkmpp',
+    'none': 'none', 'off': 'none', 'soft': 'none', 'software': 'none', 'cpu': 'none',
+    'auto': 'auto',
+}
+
+
+def mpp_host_available() -> bool:
+    """本机（控制面与 RUNTIME 同机部署时）是否具备 Rockchip VPU。
+
+    只看设备节点，不查 librockchip_mpp：真正的后端能力由 RUNTIME 侧 MppEnv 探测，
+    失败会回落软解，这里的作用只是让 edge 同机部署时 ini 写死 rkmpp 而不是 auto。
+    """
+    if platform.machine().lower() not in ('aarch64', 'arm64', 'armv8l'):
+        return False
+    return any(os.path.exists(node) for node in ('/dev/mpp_service', '/dev/vpu_service'))
+
+
+def resolve_hwaccel_backend() -> str:
+    """写入 ini `[ai] hwaccel` 的取值（auto | cuda | rkmpp | none）。
+
+    与 prefer_gpu / force_cpu 无关：那两个只决定 ONNX Runtime 的设备，RK3588 上
+    没有 CUDA 设备但必须有 VPU，早先把它们耦合在一起会导致整条编解码链路被关掉。
+    """
+    override = (os.getenv('RUNTIME_HWACCEL') or os.getenv('VIDEO_HWACCEL') or '').strip().lower()
+    if override:
+        if override in _HWACCEL_VALUES:
+            return override
+        return _HWACCEL_ALIASES.get(override, 'auto')
+    if mpp_host_available():
+        return 'rkmpp'
+    return 'auto'
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or '').strip().lower()
+    if not raw:
+        return default
+    if raw in ('1', 'true', 'yes', 'on', 'y'):
+        return True
+    if raw in ('0', 'false', 'no', 'off', 'n'):
+        return False
+    return default
+
+
+def resolve_hwaccel_decode() -> bool:
+    """写入 ini `[ai] hwaccel_decode`（RUNTIME 侧再按 auto/rkmpp/cuda 探测并回落软解）。"""
+    return _env_flag('RUNTIME_HWACCEL_DECODE', True)
+
+
+def resolve_hwaccel_encode() -> bool:
+    """写入 ini `[ai] hwaccel_encode`。"""
+    return _env_flag('RUNTIME_HWACCEL_ENCODE', True)
+
+
+def resolve_force_soft_av() -> bool:
+    """写入 ini `[ai] force_soft_av`：编解码硬件的唯一总开关（默认关）。"""
+    return _env_flag('RUNTIME_FORCE_SOFT_AV', False)
 
 
 def rknn_export_requested() -> bool:
@@ -1260,6 +1356,13 @@ def _build_runtime_ini_text(
     from app.utils.alert_class_filter import parse_alert_class_names
     alert_class_names = parse_alert_class_names(getattr(task, 'alert_class_names', None))
     alert_class_names_ini = json.dumps(alert_class_names, ensure_ascii=False, separators=(',', ':'))
+    # 编解码硬件开关与 AI 推理设备（prefer_gpu / force_cpu）彻底解耦：
+    # RK3588 上没有 CUDA 设备，prefer_gpu=false 只表示「推理走 CPU」，不该把
+    # rkvdec 硬解和 VEPU 硬编一起关掉（否则 libx264 会吃掉 30-40 % CPU）。
+    force_soft = resolve_force_soft_av()
+    hwaccel_backend = resolve_hwaccel_backend()
+    hw_decode = (not force_soft) and resolve_hwaccel_decode()
+    hw_encode = (not force_soft) and resolve_hwaccel_encode()
     return f"""# Auto-generated by VIDEO for executor=cpp — do not edit by hand while task is running
 [video]
 rtsp_url={rtsp_url}
@@ -1279,8 +1382,11 @@ frame_skip={frame_skip}
 prefer_gpu={'true' if prefer_gpu else 'false'}
 force_cpu={'true' if force_cpu else 'false'}
 gpu_device_id={gpu_device_id}
-prefer_hwaccel={'true' if (prefer_gpu and not force_cpu) else 'false'}
-force_soft_av={'true' if (force_cpu or not prefer_gpu) else 'false'}
+hwaccel={hwaccel_backend}
+hwaccel_decode={'true' if hw_decode else 'false'}
+hwaccel_encode={'true' if hw_encode else 'false'}
+prefer_hwaccel={'false' if force_soft else 'true'}
+force_soft_av={'true' if force_soft else 'false'}
 hwaccel_device_id={gpu_device_id}
 nvenc_preset={(os.getenv('RUNTIME_NVENC_PRESET') or os.getenv('REALTIME_NVENC_PRESET') or 'p3').strip() or 'p3'}
 
@@ -1706,6 +1812,11 @@ def _stream_forward_runtime_ini_content(
     log_dir = os.path.dirname(log_path) if log_path else str(runtime_config_dir())
     device_log = os.path.join(log_dir, f'forward_{device.id}')
     device_name = (device.name or device.id or '').replace('\n', ' ')
+    # 转发任务虽然 [ai] enable=false，但仍然要解码 + 重编码推流，VPU 开关照样得写：
+    # RUNTIME 只在 [ai] 段读 hwaccel*，漏写会让 RK3588 上的转发跑满 libx264。
+    force_soft = resolve_force_soft_av()
+    hw_decode = (not force_soft) and resolve_hwaccel_decode()
+    hw_encode = (not force_soft) and resolve_hwaccel_encode()
     return f"""# Auto-generated by VIDEO stream-forward executor=cpp
 [video]
 rtsp_url={rtsp_url}
@@ -1731,6 +1842,11 @@ enable_alarm=false
 
 [ai]
 enable=false
+hwaccel={resolve_hwaccel_backend()}
+hwaccel_decode={'true' if hw_decode else 'false'}
+hwaccel_encode={'true' if hw_encode else 'false'}
+prefer_hwaccel={'false' if force_soft else 'true'}
+force_soft_av={'true' if force_soft else 'false'}
 """
 
 
@@ -1786,8 +1902,13 @@ def generate_stream_forward_runtime_ini_content(
 REMOTE_RUNTIME_BIN = '/opt/easyaiot/RUNTIME/bin/RUNTIME'
 # librknnrt.so 在 Rockchip 官方固件里可能落在 /oem/usr/lib 或 /vendor/usr/lib，
 # RUNTIME 通过 dlopen 查找，因此这些目录必须进 LD_LIBRARY_PATH。
+# librockchip_mpp 则是链接期依赖（RUNTIME 直连，不是 dlopen）：RK3588 上只有
+# install_rk3588.sh mpp-setup 打过 glibc 版本节点的暂存份能在容器里加载，
+# 解析不到 RUNTIME 直接 127，不会回落软解。目录不存在时 ld.so 会静默跳过。
 REMOTE_RUNTIME_LD_LIBRARY_PATH = (
-    '/opt/easyaiot/RUNTIME/lib:/usr/local/cuda/lib64:/usr/local/cuda/lib'
+    '/opt/easyaiot/RUNTIME/lib:/opt/easyaiot/RUNTIME/.mpp-sdk/lib'
+    ':/opt/easyaiot/RUNTIME/mpp-lib'
+    ':/usr/local/cuda/lib64:/usr/local/cuda/lib'
     ':/usr/lib/x86_64-linux-gnu:/usr/lib/aarch64-linux-gnu'
     ':/usr/local/lib:/oem/usr/lib:/vendor/usr/lib'
 )
@@ -1907,6 +2028,19 @@ def runtime_library_path_env() -> str:
     ):
         if os.path.isfile(os.path.join(lib_dir, 'librknnrt.so')):
             parts.append(lib_dir)
+    # librockchip_mpp 所在目录：RK3588 上 RUNTIME 直接链 MPP（rkvdec 硬解 / VEPU 硬编）。
+    # 与 librknnrt 不同，这是链接期依赖 —— 解析不到 RUNTIME 进程根本起不来（127），
+    # 而不是「回落软解」，所以这里必须显式补上，不能只靠 existing 透传。
+    # RUNTIME/.mpp-sdk/lib 是 install_rk3588.sh mpp-setup 的产物（已把 GLIBC_2.29
+    # 版本节点重定向到容器有的 GLIBC_2.17）；宿主 /usr/lib 那份在容器里链不动，故意不列。
+    for mpp_dir in (
+        '/opt/easyaiot/RUNTIME/.mpp-sdk/lib',
+        '/opt/easyaiot/RUNTIME/mpp-lib',
+        str((_repo_root() / 'RUNTIME' / '.mpp-sdk' / 'lib')),
+        str((_repo_root() / 'RUNTIME' / 'mpp-lib')),
+    ):
+        if glob.glob(os.path.join(mpp_dir, 'librockchip_mpp.so*')):
+            parts.append(mpp_dir)
     # dedupe preserve order
     seen = set()
     out = []

@@ -1,0 +1,33 @@
+/*
+ * glibc229_shim.map -- linker version script for
+ * RUNTIME/tools/glibc229_pow_log_log2_shim.c
+ *
+ * This file does two jobs, and the second one is the reason it cannot be replaced
+ * by .symver directives in the C source alone.
+ *
+ *  1. It declares that this object DEFINES the version node GLIBC_2.29 and that
+ *     pow/log/log2 are its contents.
+ *  2. It satisfies ld's requirement that a version node must exist among the
+ *     shared objects on the link map before any reference qualified with it is
+ *     accepted. Concretely: librockchip_mpp.so.0 imports pow@GLIBC_2.29, and if
+ *     no loaded object exports a GLIBC_2.29 node, ld rejects the link with
+ *     "undefined reference to `pow@GLIBC_2.29'" even when an unqualified pow was
+ *     found. That is the failure mode observed on the board and it is the reason
+ *     -lm alone did not help.
+ *
+ * Anything not listed becomes LOCAL, which keeps the shim's own helper names out
+ * of .dynsym. Only the three bridged symbols must ever be visible.
+ *
+ * Build:
+ *   gcc -O2 -fPIC -shared -Wall glibc229_pow_log_log2_shim.c \
+ *       -o libmppshim.so.6 -Wl,--version-script=glibc229_shim.map -lm
+ */
+
+GLIBC_2.29 {
+    global:
+        pow;
+        log;
+        log2;
+    local:
+        *;
+};

@@ -224,8 +224,11 @@ int Detech::stop() {
 namespace {
 RtmpEncoderOptions makeRtmpOpts(const Config& cfg) {
     RtmpEncoderOptions opts;
-    opts.preferHw = cfg.preferHwaccel;
-    opts.forceSoft = cfg.forceSoftAv;
+    // hwaccelEncodeEnabled() already folds in prefer_hwaccel / force_soft_av /
+    // hwaccel=none, so the encoder only needs the verdict plus the family name.
+    opts.preferHw = runtime::hwaccelEncodeEnabled(cfg);
+    opts.forceSoft = !opts.preferHw;
+    opts.hwaccel = cfg.hwaccel;
     opts.gpuDeviceId = cfg.hwaccelDeviceId >= 0 ? cfg.hwaccelDeviceId : cfg.gpuDeviceId;
     opts.nvencPreset = cfg.nvencPreset.empty() ? "p3" : cfg.nvencPreset;
     opts.bitRate = cfg.videoBitRate;
@@ -505,6 +508,11 @@ void Detech::_controlServerThreadFunc() {
             response["gpu_device_id"] = this->_config.gpuDeviceId;
             response["prefer_hwaccel"] = this->_config.preferHwaccel;
             response["force_soft_av"] = this->_config.forceSoftAv;
+            // What was asked for, alongside the decode_ep / encode_ep verdicts
+            // above, so a fallback to CPU is distinguishable from a misconfig.
+            response["hwaccel"] = this->_config.hwaccel;
+            response["hwaccel_decode"] = runtime::hwaccelDecodeEnabled(this->_config);
+            response["hwaccel_encode"] = runtime::hwaccelEncodeEnabled(this->_config);
             response["infer_backend"] = this->_config.inferBackend.empty()
                 ? "auto"
                 : this->_config.inferBackend;
@@ -687,8 +695,11 @@ bool Detech::_init_yolo_detector() {
 
 bool Detech::_init_media_player() {
     LOG(INFO) << "[INIT] Initializing media player"
+              << " hwaccel=" << (_config.hwaccel.empty() ? "auto" : _config.hwaccel)
               << " prefer_hwaccel=" << (_config.preferHwaccel ? "true" : "false")
               << " force_soft_av=" << (_config.forceSoftAv ? "true" : "false")
+              << " hwaccel_decode=" << (runtime::hwaccelDecodeEnabled(_config) ? "true" : "false")
+              << " hwaccel_encode=" << (runtime::hwaccelEncodeEnabled(_config) ? "true" : "false")
               << " hwaccel_device_id=" << _config.hwaccelDeviceId;
     if (!_ffmpegFormatCtx) {
         _ffmpegFormatCtx = avformat_alloc_context();
@@ -721,11 +732,13 @@ bool Detech::_init_media_player() {
     _videoIndex = av_find_best_stream(_ffmpegFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (_videoIndex > -1) {
         AVCodecParameters* videoCodecPar = _ffmpegFormatCtx->streams[_videoIndex]->codecpar;
+        const bool hwDecode = runtime::hwaccelDecodeEnabled(_config);
         if (!runtime::openVideoDecoder(&_ffmpegCodecCtx, videoCodecPar,
-                                       _config.preferHwaccel,
-                                       _config.forceSoftAv,
+                                       hwDecode,
+                                       !hwDecode,
                                        _config.hwaccelDeviceId,
-                                       &_hwDecodeState)) {
+                                       &_hwDecodeState,
+                                       _config.hwaccel)) {
             LOG(ERROR) << "openVideoDecoder error";
             return false;
         }
@@ -737,11 +750,15 @@ bool Detech::_init_media_player() {
         else {
             _videoFps = _ffmpegStream->avg_frame_rate.num / _ffmpegStream->avg_frame_rate.den;
         }
-        _videoWidth = _ffmpegCodecCtx->width;
-        _videoHeight = _ffmpegCodecCtx->height;
+        // rkmpp decodes outside FFmpeg, so there is no codec context to read the
+        // coded size from; fall back to the demuxer parameters.
+        _videoWidth = _ffmpegCodecCtx ? _ffmpegCodecCtx->width : _hwDecodeState.codedWidth;
+        _videoHeight = _ffmpegCodecCtx ? _ffmpegCodecCtx->height : _hwDecodeState.codedHeight;
         _videoChannel = 3;
         LOG(INFO) << "[OK] Media player ready " << _videoWidth << "x" << _videoHeight
-                  << "@" << _videoFps << "fps decode_ep=" << _hwDecodeState.decodeEp;
+                  << "@" << _videoFps << "fps decode_ep=" << _hwDecodeState.decodeEp
+                  << " prefer_hwaccel=" << (_config.preferHwaccel ? "true" : "false")
+                  << " force_soft_av=" << (_config.forceSoftAv ? "true" : "false");
     }
     return true;
 }

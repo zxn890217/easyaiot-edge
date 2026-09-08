@@ -13,10 +13,17 @@
 #   ./install_rk3588.sh update               # git pull → build → 重启服务 → verify
 #   ./install_rk3588.sh verify               # NPU 端到端校验（容器设备/librknnrt/后端回落/健康）
 #   ./install_rk3588.sh npu                  # NPU 设备节点、librknnrt 版本、三核负载一览
-#   ./install_rk3588.sh sdk-setup          # 扫描本机现成 rknpu2 SDK 并落到 RUNTIME/.rknn-sdk
+#   ./install_rk3588.sh sdk-setup            # 扫描本机现成 rknpu2 SDK 并落到 RUNTIME/.rknn-sdk
+#   ./install_rk3588.sh mpp-setup            # 暂存 rk_mpi.h + 修补 librockchip_mpp 到 RUNTIME/.mpp-sdk
 #   ./install_rk3588.sh runtime-bundle X.tgz # 用离线包更新 /opt/easyaiot/RUNTIME（OTA 场景）
 #   ./install_rk3588.sh model-export         # 打印 .rknn 转换的正确姿势（只能在 x86 控制面做）
 #   ./install_rk3588.sh status|logs|restart|start|stop
+#
+# verify 只回答「整条链路通不通」。要按判据逐条取证（shell / Python 控制面 / C++ 三处 NPU
+# 探测是否同源、card 节点是否真进了 devices 白名单、librockchip_mpp 与硬编硬解链路）用：
+#   bash RUNTIME/scripts/verify_rk_media.sh                            # 宿主全量（含实跑探针）
+#   bash RUNTIME/scripts/verify_rk_media.sh --no-probe                 # 只做静态判据校验
+#   bash RUNTIME/scripts/verify_rk_media.sh --container=video-service  # 进容器复跑并比对
 #
 # 环境变量:
 #   RKNN_SDK_ROOT          rknpu2 SDK 目录（其下有 include/rknn_api.h）。留空自动探测，
@@ -26,6 +33,16 @@
 #                          on  ：缺 SDK 直接失败（CI/出包机用，避免产出无 NPU 后端的二进制）
 #                          多数盒子镜像只装了 librknnrt.so（运行期）而没有 rknn_api.h（编译期），
 #                          先跑 ./install_rk3588.sh sdk-setup 补 SDK，再 build 即可上 NPU
+#   MPP_SDK_ROOT           Rockchip MPP SDK 目录（include/rockchip/rk_mpi.h + lib/）。留空自动
+#                          探测，约定落点 RUNTIME/.mpp-sdk —— 必须是 mpp-setup 产出的那份
+#   RUNTIME_WITH_MPP       auto(默认) / on / off —— rkvdec 硬解 + VEPU 硬编后端
+#                          auto：有 SDK 就编，没有则编纯软解软编（1080p25 约吃 1.5 个 A76）
+#                          盒子镜像普遍只有 librockchip_mpp.so.0 而没有 rk_mpi.h，且那份库要求
+#                          GLIBC_2.29（video-service 容器是 glibc 2.28）—— 先跑 mpp-setup 把
+#                          头文件收进仓库、把版本节点重定向到 GLIBC_2.17，再 build
+#   MPP_HEADER_DIR         手工指定 rk_mpi.h 所在目录（跳过全盘扫描）
+#   MPP_PATCH_TOOL         预编译好的 RUNTIME/tools/mpp_glibc_patch（盒子无 gcc 时用）
+#   MPP_FORCE=1            忽略已就绪的 RUNTIME/.mpp-sdk，重新暂存并重打补丁
 #   RUNTIME_INFER_BACKEND  auto(默认) / rknn / onnx —— 透传给 VIDEO 控制面与 RUNTIME
 #   RUNTIME_NPU_CORE_MASK  auto(默认) / all / per_thread / core0 / core1 / core2 / core0_1
 #   EASYAIOT_RUNTIME_BUILD_MODE  docker(默认，与 VIDEO 同源 glibc) / host(需 conda)
@@ -59,11 +76,14 @@ print_error()   { error "$1"; }
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/RUNTIME/scripts/rknn_sdk.sh"
 # shellcheck disable=SC1091
+source "$SCRIPT_DIR/RUNTIME/scripts/mpp_sdk.sh"
+# shellcheck disable=SC1091
 source "$SCRIPT_DIR/.scripts/docker/module_update_helpers.sh"
 
 WEB_PORT="${WEB_PORT:-8888}"
 RUNTIME_WITH_RKNN="${RUNTIME_WITH_RKNN:-auto}"
-export WEB_PORT RUNTIME_WITH_RKNN
+RUNTIME_WITH_MPP="${RUNTIME_WITH_MPP:-auto}"
+export WEB_PORT RUNTIME_WITH_RKNN RUNTIME_WITH_MPP
 
 RUNTIME_BIN_PATH="$SCRIPT_DIR/RUNTIME/build/RUNTIME"
 VIDEO_CONTAINER="video-service"
@@ -292,6 +312,284 @@ sdk_setup() {
     info "  完成。接着跑：$0 build"
 }
 
+# 扫本机现成的 rk_mpi.h（厂商 rootfs 的开发包、SDK 解压包都可能是来源）
+scan_mpp_headers() {
+    local root
+    for root in /usr/include /usr/local/include /opt /srv /home /root \
+                /userdata /data /oem /vendor /workspace; do
+        [ -d "$root" ] || continue
+        find "$root" -maxdepth 6 \
+            \( -name .git -o -name node_modules -o -name site-packages -o -name .build-cache \
+               -o -name .mpp-sdk -o -name .rknn-sdk \) -prune -o \
+            \( -type f -o -type l \) -name rk_mpi.h -print 2>/dev/null
+    done
+}
+
+# 头文件路径 → 存放 rk_mpi.h 的目录。两种布局都只去掉尾巴即可：
+#   <root>/include/rockchip/rk_mpi.h -> <root>/include/rockchip
+#   <sdk>/  rockchip/rk_mpi.h        -> <sdk>/rockchip
+# 结果直接喂给 cp -aL "$dir/."，与 RUNTIME/CMakeLists.txt 的两段 find_path 对得上。
+mpp_header_dir() {
+    sed -e 's#/rk_mpi\.h$##'
+}
+
+# 容器里能不能解析到某个 soname（video-service 没起来时返回 2 = 未知）。
+# 库名走位置参数传给 sh，省掉「外层双引号里再套内层引号」那套转义——之前那样写会把
+# glob 也一起引号化，ls 反而永远失败。
+container_has_lib() {
+    local name="$1" container="${2:-$VIDEO_CONTAINER}"
+    docker_ready || return 2
+    docker exec "$container" sh -c '
+        name="$1"
+        for d in /usr/lib64 /usr/lib /lib64 /lib /usr/lib/aarch64-linux-gnu \
+                 /usr/local/lib64 /usr/local/lib; do
+            for f in "$d/$name" "$d/${name}."*; do
+                [ -e "$f" ] && exit 0
+            done
+        done
+        exit 1' sh "$name" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# 把宿主 MPP 开发包整理成 RUNTIME/.mpp-sdk/{include/rockchip,lib}，
+# 并把 librockchip_mpp 的 GLIBC_2.29 版本依赖重定向到容器（glibc 2.28）有的 GLIBC_2.17。
+# 这是 docker 同源编译模式下唯一能让 rkmpp 后端编出来、又能跑起来的做法。
+mpp_setup() {
+    step "准备编译期 MPP SDK → RUNTIME/.mpp-sdk（含 GLIBC 版本节点重定向）"
+    local target="$SCRIPT_DIR/RUNTIME/.mpp-sdk"
+    local from="${MPP_GLIBIC_FROM:-GLIBC_2.29}" to="${MPP_GLIBIC_TO:-GLIBC_2.17}"
+
+    # 幂等：已就绪就只做体检，重复跑不会把补丁后的库再套一层
+    if [ "${MPP_FORCE:-0}" != "1" ] && [ -f "$target/include/rockchip/rk_mpi.h" ] \
+       && mpp_staged_lib >/dev/null 2>&1; then
+        success "  RUNTIME/.mpp-sdk 已就绪（重做用 MPP_FORCE=1 $0 mpp-setup）"
+        _mpp_report "$target"
+        export MPP_SDK_ROOT="$target"
+        return 0
+    fi
+
+    # --- 1) 头文件 ----------------------------------------------------------
+    local hdr="" cand
+    if [ -n "${MPP_HEADER_DIR:-}" ]; then
+        [ -d "$MPP_HEADER_DIR" ] || { error "  MPP_HEADER_DIR 不存在: $MPP_HEADER_DIR"; return 1; }
+        hdr="$MPP_HEADER_DIR"
+        info "  使用显式指定的头文件目录: $hdr"
+    else
+        for cand in /usr/include/rockchip /usr/local/include/rockchip; do
+            [ -f "$cand/rk_mpi.h" ] && { hdr="$cand"; break; }
+        done
+    fi
+    if [ -z "$hdr" ]; then
+        local hits
+        hits="$(scan_mpp_headers | mpp_header_dir | sort -u || true)"
+        if [ -z "$hits" ]; then
+            error "  本机没搜到 rk_mpi.h（厂商精简镜像常只带运行库，不带开发包）"
+            error "  装开发包：sudo apt-get install librkmpp-dev   # 或 librockchip-mpp-dev"
+            error "  或从 MPP 源码树取：rockchip-linux/mpp 的 inc/ 目录"
+            error "  已有别处副本时：MPP_HEADER_DIR=/path/to/include/rockchip $0 mpp-setup"
+            return 1
+        fi
+        printf '  搜到候选头文件目录：\n'
+        printf '%s\n' "$hits" | sed 's/^/    /'
+        hdr="$(printf '%s\n' "$hits" | head -n1)"
+        info "  取第一个：$hdr（换别的用 MPP_HEADER_DIR=/path $0 mpp-setup）"
+    fi
+    [ -f "$hdr/rk_mpi.h" ] || { error "  $hdr 下没有 rk_mpi.h"; return 1; }
+
+    mkdir -p "$target/include/rockchip" "$target/lib" \
+        || { error "  无法创建 $target（docker 编译要靠它进容器，必须落在仓库内）"; return 1; }
+    if [ "${hdr%/}" = "${target}/include/rockchip" ]; then
+        # MPP_FORCE=1 重跑时，来源可能就是上一次暂存的结果（例如仓库被放在 /root 下
+        # 且手工指定过 MPP_HEADER_DIR）。源和目标是同一个目录，cp 只会自撞。
+        info "  头文件已在暂存目录里，跳过拷贝"
+    else
+        cp -aL "$hdr"/. "$target/include/rockchip"/ 2>/dev/null \
+            || { error "  拷贝头文件失败"; return 1; }
+    fi
+    success "  头文件 → $target/include/rockchip（$(find "$target/include/rockchip" -name '*.h' | wc -l) 个 .h）"
+
+    # --- 2) 运行库（+ glibc 版本节点重定向）--------------------------------
+    local sys=""
+    if ! sys="$(mpp_system_runtime_lib 2>/dev/null)"; then
+        error "  宿主系统路径里没有 librockchip_mpp.so*：MPP 用户态驱动未安装"
+        error "  装厂商包（librockchip-mpp / librkmpp）后重跑本命令"
+        rm -rf "$target"
+        return 1
+    fi
+    info "  宿主运行库: $sys"
+    local soname tmp_in="$target/.mpp-in.tmp" patched="$target/.mpp-out.tmp"
+    soname="$(mpp_soname "$sys" || true)"
+    [ -n "$soname" ] || soname="$(basename "$sys")"
+    cp -aL "$sys" "$tmp_in" 2>/dev/null \
+        || { error "  拷贝 $sys 失败"; rm -f "$tmp_in"; return 1; }
+
+    local rc=0
+    if ! mpp_patch_tool >/dev/null 2>&1; then
+        warn "  编译不出 mpp_glibc_patch（宿主无 gcc/cc，且未预置 MPP_PATCH_TOOL）"
+        warn "  无法判断/修复 ${from} 依赖：原样暂存。容器里链接若报"
+        warn "    version \`${from}' not found —— 装个 gcc 再 MPP_FORCE=1 $0 mpp-setup"
+    elif mpp_needs_glibc_patch "$tmp_in" "$from"; then
+        info "  检测到 ${from} 依赖（容器 glibc 2.28 没有），重定向到 ${to}"
+        if ! mpp_patch_glibc "$tmp_in" "$patched" "$from" "$to"; then
+            error "  版本节点重定向失败：见 RUNTIME/tools/mpp_glibc_patch.c 的说明"
+            rm -f "$tmp_in" "$patched"
+            return 1
+        fi
+        mv -f "$patched" "$tmp_in" || { error "  落盘失败"; rm -f "$tmp_in"; return 1; }
+        success "  已重定向：$from -> $to"
+        # 补丁后必须仍然只要求容器有的版本；再查一遍，挡掉 2.30/2.31 这类漏网的
+        if mpp_needs_glibc_patch "$tmp_in" "$from"; then
+            error "  重定向后仍残留 ${from}（elf_hash 自检未过或存在共享偏移）—— 不敢用这份库"
+            rm -f "$tmp_in"
+            return 1
+        fi
+    else
+        info "  未发现 ${from} 依赖，原样使用"
+    fi
+    # 目录里绝不留下第二个 librockchip_mpp：CMake 的 find_file 按 .so.0 → .so.1 顺序取，
+    # 挑到未打补丁的那份就等于白干。
+    rm -f "$target"/lib/librockchip_mpp.so* 2>/dev/null || true
+    mv -f "$tmp_in" "$target/lib/$soname" \
+        || { error "  写入 $target/lib/$soname 失败"; rm -f "$tmp_in"; return 1; }
+    ln -sf "$soname" "$target/lib/librockchip_mpp.so" 2>/dev/null || true
+    success "  运行库 → $target/lib/$soname（DT_NEEDED 用的就是这个名字）"
+
+    # --- 3) 传递依赖：容器缺一个，RUNTIME 就整个起不来 ----------------------
+    _mpp_stage_deps "$target/lib/$soname" "$target/lib" || rc=$?
+
+    _mpp_report "$target"
+    export MPP_SDK_ROOT="$target"
+    info "  完成。接着跑：$0 build"
+    return "$rc"
+}
+
+# glibc / libstdc++ 这类基础库绝不能从宿主搬进容器（会顶掉容器自己的，直接 SIGSEGV，
+# 与 ensure_runtime_cpp.sh 里对 CUDA 的处理同理）。它们缺版本节点该走补丁，不该走挂载。
+MPP_BASE_LIBS=" libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libutil.so.1
+               libresolv.so.1 libnss_files.so.2 libstdc++.so.6 libgcc_s.so.1
+               ld-linux-aarch64.so.1 ld-linux-x86-64.so.2 "
+
+# 把 soname 的 DT_NEEDED 里「容器没有、宿主有」的那些补进 $2 目录，同样过一遍 glibc 补丁。
+# 返回非 0 表示有依赖既不在容器里也搬不过来 —— 调用方告警即可，暂存目录仍然可用。
+_mpp_stage_deps() {
+    local lib="$1" libdir="$2" need missing=0 staged=0
+    local from="${MPP_GLIBIC_FROM:-GLIBC_2.29}" to="${MPP_GLIBIC_TO:-GLIBC_2.17}"
+    local needed
+    needed="$(mpp_lib_needed "$lib" 2>/dev/null || true)"
+    [ -n "$needed" ] || return 0   # 没有 readelf/objdump：跳过，交给运行期报错
+    for need in $needed; do
+        case "$MPP_BASE_LIBS" in *" $need "*) continue ;; esac
+        local have=0
+        container_has_lib "$need" || have=$?
+        if [ "$have" = "0" ]; then
+            continue
+        elif [ "$have" = "2" ]; then
+            info "  容器未在运行，跳过 $need 的存在性检查"
+            continue
+        fi
+        local src
+        src="$(mpp_find_soname "$need")" || {
+            error "  $lib 需要 $need：容器里没有，宿主上也找不到 —— 容器内加载 RUNTIME 会失败"
+            error "  应急：$0 build 前 export RUNTIME_WITH_MPP=off，先把编解码留在 CPU"
+            missing=$((missing + 1))
+            continue
+        }
+        cp -aL "$src" "$libdir/$need" 2>/dev/null || {
+            warn "  拷贝 $src 失败，跳过 $need"
+            missing=$((missing + 1))
+            continue
+        }
+        if mpp_needs_glibc_patch "$libdir/$need" "$from"; then
+            if mpp_patch_glibc "$libdir/$need" "$libdir/.$need.tmp" "$from" "$to" >/dev/null 2>&1; then
+                mv -f "$libdir/.$need.tmp" "$libdir/$need"
+                info "  依赖 $need 也做了 $from -> $to 重定向"
+            else
+                rm -f "$libdir/.$need.tmp"
+                warn "  依赖 $need 带 ${from} 且补丁失败：容器内可能仍加载不了"
+            fi
+        fi
+        success "  依赖 $need → $libdir/$need（来自 $src）"
+        staged=$((staged + 1))
+    done
+    [ "$staged" -gt 0 ] && info "  共补入 $staged 个传递依赖，已随 RUNTIME/.mpp-sdk/lib 一起挂载"
+    return "$missing"
+}
+
+# 在宿主常见前缀里找一个 soname 实体（厂商库多为「只有版本号后缀、无 dev 软链」）
+mpp_find_soname() {
+    local name="$1" dir cand
+    for dir in /usr/lib /usr/lib64 /usr/local/lib /usr/lib/aarch64-linux-gnu \
+               /usr/local/lib/aarch64-linux-gnu /oem/usr/lib /vendor/usr/lib /usr/lib/rockchip; do
+        for cand in "$dir/$name" "$dir/$name.0" "$dir/$name.1"; do
+            [ -e "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+        done
+    done
+    return 1
+}
+
+# 暂存结果一览（体检与 mpp-setup 结尾共用）
+_mpp_report() {
+    local target="$1" lib ver="" soname=""
+    lib="$(mpp_staged_lib 2>/dev/null || true)"
+    if [ -z "$lib" ]; then
+        warn "  暂存目录里没有 librockchip_mpp：$target/lib"
+        return 0
+    fi
+    soname="$(basename "$lib")"
+    ver="$(mpp_version "$lib")"
+    printf '  暂存 SDK   : %s\n' "$target"
+    printf '  编译期库   : lib/%s%s\n' "$soname" "${ver:+ (version $ver)}"
+    if command -v readelf >/dev/null 2>&1 || command -v objdump >/dev/null 2>&1; then
+        printf '  版本依赖   : %s\n' "$(mpp_lib_versions "$lib" 2>/dev/null \
+            | awk -F'version=' '/version=/ {split($2, a, " "); printf "%s ", a[1]}' || true)"
+    fi
+    return 0
+}
+
+# MPP 体检：编译期头文件 + 运行库形态。与 RKNN 的区别在于这里多一道坎 ——
+# 板上那份 librockchip_mpp 要求 GLIBC_2.29，video-service 容器（glibc 2.28）吃不下，
+# 必须是 mpp-setup 重定向过版本节点、落在 RUNTIME/.mpp-sdk 里的那份。
+check_mpp_sdk() {
+    step "编译期 Rockchip MPP（rk_mpi.h + librockchip_mpp）"
+    local sdk want
+    want="$(printf '%s' "$RUNTIME_WITH_MPP" | tr '[:upper:]' '[:lower:]')"
+    if sdk="$(mpp_sdk_probe)"; then
+        success "  SDK 根目录: $sdk"
+        _mpp_report "$sdk"
+    elif mpp_header_found; then
+        success "  系统 include 里已有 rk_mpi.h（EASYAIOT_RUNTIME_BUILD_MODE=host 可直接编）"
+        warn "  docker 编译看不到宿主 /usr，上硬解仍需：$0 mpp-setup"
+    elif [ "$want" = "off" ]; then
+        warn "  RUNTIME_WITH_MPP=off：不编 rkmpp 后端，跳过检查"
+        return 0
+    else
+        error "  未找到 MPP 开发包（rockchip/rk_mpi.h），RUNTIME 编不出 rkvdec/VEPU 后端"
+        error "  盒子镜像通常只带运行期 librockchip_mpp.so.0，编译期头文件要自己补："
+        error "    1) ./install_rk3588.sh mpp-setup   # 扫本机 /usr/include/rockchip 等"
+        error "    2) 扫不到就装包：sudo apt-get install -y librkmpp-dev   # 或 librockchip-mpp-dev"
+        error "    3) 已有别处副本：MPP_HEADER_DIR=/path/to/rockchip $0 mpp-setup"
+        if [ "$want" = "auto" ]; then
+            warn "  RUNTIME_WITH_MPP=auto：本次继续编纯软解/软编（1080p25 约吃 1.5 个 A76）"
+            return 0
+        fi
+        return 1
+    fi
+    # 库的形态决定容器里链不链得动：只有暂存那份保证改过版本节点
+    local lib
+    if lib="$(mpp_staged_lib 2>/dev/null)"; then
+        if mpp_patch_tool >/dev/null 2>&1 && mpp_needs_glibc_patch "$lib"; then
+            error "  $lib 仍要求 ${MPP_GLIBIC_FROM:-GLIBC_2.29}：容器里链接/加载都会失败"
+            error "  重打补丁：MPP_FORCE=1 $0 mpp-setup"
+            return 1
+        fi
+    elif [ "$want" != "off" ]; then
+        warn "  暂存目录里没有 librockchip_mpp：当前只有宿主系统那份（要求 GLIBC_2.29）"
+        warn "  docker 编译会失败：$0 mpp-setup 后重跑 $0 build"
+        [ "$want" = "on" ] && return 1
+    fi
+    return 0
+}
+
 check_resources() {
     step "资源与磁盘"
     local cores mem_gb free_gb
@@ -325,6 +623,24 @@ runtime_has_rknn() {
     return 1
 }
 
+# ldd 直接看二进制有没有链到 librockchip_mpp（CMakeLists 只在开启 MPP 时才链接）
+binary_links_mpp() {
+    command -v ldd >/dev/null 2>&1 \
+        && ldd "$1" 2>/dev/null | grep -q librockchip_mpp
+}
+
+# 已产出的二进制是否真带 rkmpp 编解码后端：0=带 1=不带 2=还没编
+# 只看 CMakeCache / ldd，不看运行期 —— 运行期能不能真用上硬解由 verify 里的 /health 说了算
+runtime_has_mpp() {
+    [ -x "$RUNTIME_BIN_PATH" ] || return 2
+    local cache="$SCRIPT_DIR/RUNTIME/build/CMakeCache.txt"
+    if [ -f "$cache" ] && grep -q '^RUNTIME_WITH_MPP:BOOL=ON' "$cache" 2>/dev/null; then
+        return 0
+    fi
+    binary_links_mpp "$RUNTIME_BIN_PATH" && return 0
+    return 1
+}
+
 report_runtime_artifact() {
     step "RUNTIME 产物"
     local rc=0
@@ -334,6 +650,13 @@ report_runtime_artifact() {
         1) error   "  $RUNTIME_BIN_PATH 未编入 RKNN 后端（当前只会用 ONNX Runtime CPU）"
            error   "  重编：$0 build" ;;
         2) warn    "  尚未编译：$RUNTIME_BIN_PATH 不存在（先 $0 build 或 install）" ;;
+    esac
+    local mrc=0
+    runtime_has_mpp || mrc=$?
+    case "$mrc" in
+        0) success "  已编入 rkmpp 编解码后端（rkvdec 硬解 + VEPU 硬编）" ;;
+        1) warn    "  未编入 rkmpp 后端：解帧/推流会吃 CPU（约 1.5 个 A76 @1080p25）"
+           warn    "  补法：$0 mpp-setup && $0 build" ;;
     esac
     if [ -f "$SCRIPT_DIR/RUNTIME/build/VERSION" ]; then
         printf '  版本      : %s\n' "$(grep -m1 '^version=' "$SCRIPT_DIR/RUNTIME/build/VERSION" | cut -d= -f2-)"
@@ -350,6 +673,7 @@ doctor_all() {
     if is_arm64 || [ "${RK3588_ALLOW_NON_ARM64:-0}" = "1" ]; then
         check_npu_driver || rc=1
         check_rknn_sdk || rc=1
+        check_mpp_sdk || rc=1
     fi
     check_resources
     report_runtime_artifact
@@ -375,6 +699,12 @@ npu_snapshot() {
     if lib="$(rknn_runtime_lib)"; then
         printf '  librknnrt : %s\n' "$lib"
         ls -l "$lib" | sed 's/^/  /' || true
+    fi
+    # 编解码运行库单独列一行：mpp-setup 打过补丁的那份就在仓库里，路径与宿主原件不同
+    if lib="$(mpp_runtime_lib 2>/dev/null)"; then
+        printf '  librockchip_mpp : %s\n' "$lib"
+        command -v readelf >/dev/null 2>&1 \
+            && printf '  SONAME          : %s\n' "$(mpp_soname "$lib")"
     fi
     local f
     for f in /sys/kernel/debug/rknpu/load /sys/class/devfreq/fdab0000.npu/load; do
@@ -407,6 +737,16 @@ export_rknn_env() {
         export RKNN_SDK_ROOT="$sdk"
         info "使用 RKNN SDK: $sdk"
     fi
+    # MPP（rkvdec/VEPU）：仓库内那份是唯一能被容器里的 ld 接受的形态
+    local mpp=""
+    mpp="$(mpp_sdk_probe || true)"
+    if [ -n "$mpp" ]; then
+        export MPP_SDK_ROOT="$mpp"
+        info "使用 MPP SDK: $mpp"
+    elif [ "$(printf '%s' "$RUNTIME_WITH_MPP" | tr '[:upper:]' '[:lower:]')" != "off" ]; then
+        warn "未找到 MPP SDK（RUNTIME/.mpp-sdk）：本次编出的 RUNTIME 无 rkmpp 后端，编解码留在 CPU"
+        warn "  上硬解/硬编：$0 mpp-setup 后重跑 $0 build"
+    fi
     if [ -n "${RUNTIME_INFER_BACKEND:-}" ]; then
         export RUNTIME_INFER_BACKEND
         info "推理后端强制: $RUNTIME_INFER_BACKEND"
@@ -432,7 +772,7 @@ build_runtime_arm() {
         warn "EASYAIOT_RUNTIME_SKIP=1，跳过 RUNTIME 编译"
         return 0
     fi
-    step "编译 RUNTIME（RUNTIME_WITH_RKNN=$RUNTIME_WITH_RKNN）"
+    step "编译 RUNTIME（RUNTIME_WITH_RKNN=$RUNTIME_WITH_RKNN RUNTIME_WITH_MPP=$RUNTIME_WITH_MPP）"
     if ! bash RUNTIME/install_linux.sh build; then
         error "RUNTIME 编译失败"
         return 1
@@ -455,6 +795,24 @@ build_runtime_arm() {
         warn "  现在也能用：视频算法任务照跑，只是不占 NPU 算力；随时用 $0 verify 复核"
     else
         success "RUNTIME 已带 RKNN 后端"
+    fi
+    # 编解码后端单独判一次：RKNN 只解决推理，硬解/硬编是另一条链路
+    local mrc=0 mwant
+    mwant="$(printf '%s' "$RUNTIME_WITH_MPP" | tr '[:upper:]' '[:lower:]')"
+    runtime_has_mpp || mrc=$?
+    if [ "$mrc" = "2" ]; then
+        error "  产物缺失：$RUNTIME_BIN_PATH"
+        return 1
+    elif [ "$mrc" = "1" ]; then
+        if [ "$mwant" = "on" ]; then
+            error "编译完成但二进制里没有 rkmpp 后端，编解码仍会吃 CPU"
+            error "  多半是 RUNTIME/.mpp-sdk 没被容器看到：$0 mpp-setup 后重跑 $0 build"
+            return 1
+        fi
+        warn "编译完成，但二进制未链接 librockchip_mpp —— 解帧/推流走 CPU"
+        warn "  上硬解/硬编：$0 mpp-setup && $0 build"
+    else
+        success "RUNTIME 已带 rkmpp 编解码后端"
     fi
     return 0
 }
@@ -480,8 +838,9 @@ build_images() {
 }
 
 wire_npu_mount() {
-    step "接线 NPU 设备/库到 VIDEO 容器"
-    # 该脚本会探测 librknnrt.so 与设备节点，生成 .docker-compose.runtime.override.yaml
+    step "接线 NPU/MPP 设备与运行库到 VIDEO 容器"
+    # 该脚本会探测 librknnrt.so、RUNTIME/.mpp-sdk/lib 与设备节点（含 /dev/dma_heap/*），
+    # 生成 .docker-compose.runtime.override.yaml
     bash VIDEO/scripts/ensure_runtime_cpp.sh wire
 }
 
@@ -639,6 +998,21 @@ verify_host_side() {
             error "  override 里没有 rknn-lib：跑一次 $0 build 或在盒子上补 RKNN SDK/librknnrt.so"
             rc=1
         fi
+        # rkmpp 的运行库不新增挂载点（.mpp-sdk 在已挂载的 RUNTIME 目录里），
+        # 判据是 LD_LIBRARY_PATH 里那条 .mpp-sdk/lib
+        local mrc=0
+        runtime_has_mpp || mrc=$?
+        if [ "$mrc" = "0" ]; then
+            if grep -q 'mpp-sdk/lib' "$SCRIPT_DIR/VIDEO/.docker-compose.runtime.override.yaml"; then
+                success "  compose override 已为容器开启 rkmpp 运行库通路"
+            else
+                error "  RUNTIME 链了 librockchip_mpp，但 override 的 LD_LIBRARY_PATH 里没有 .mpp-sdk/lib"
+                error "  重新生成：bash VIDEO/scripts/ensure_runtime_cpp.sh wire，再 $0 restart"
+                rc=1
+            fi
+        elif [ "$mrc" = "1" ]; then
+            warn "  本次 RUNTIME 无 rkmpp 后端，跳过编解码运行库检查（$0 mpp-setup && $0 build 可补）"
+        fi
         grep -E '^\s+- /dev/' "$SCRIPT_DIR/VIDEO/.docker-compose.runtime.override.yaml" \
             | sed 's/^/    设备透传:/' || warn "  override 未包含任何 /dev 节点"
         # RKNPU 的 card 主节点必须出现，否则容器内一定打不开设备
@@ -702,15 +1076,18 @@ verify_container_side() {
     local rc=0 out verdict
     out="$(docker exec "$VIDEO_CONTAINER" sh -c '
         echo "-- 设备节点 --"
-        ls /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service /dev/dri/renderD* /dev/dri/card* 2>/dev/null || echo "（无）"
+        ls /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service /dev/vpu_service /dev/dri/renderD* /dev/dri/card* 2>/dev/null || echo "（无）"
+        ls -d /dev/dma_heap/* 2>/dev/null || echo "（无 /dev/dma_heap）"
         echo "-- cgroup 设备白名单 --"
         cat /sys/fs/cgroup/devices/devices.list 2>/dev/null | grep -E "^c (226|10|241)" || true
         echo "-- librknnrt --"
         ls -1 /opt/easyaiot/rknn-lib/librknnrt.so /usr/lib/librknnrt.so 2>/dev/null || echo "（容器内未找到）"
+        echo "-- librockchip_mpp --"
+        ls -1 /opt/easyaiot/RUNTIME/.mpp-sdk/lib/librockchip_mpp.so* 2>/dev/null || echo "（容器内未找到）"
         echo "-- RUNTIME --"
         test -x /opt/easyaiot/RUNTIME/build/RUNTIME && /opt/easyaiot/RUNTIME/build/RUNTIME --version 2>&1 | head -n2
         echo "-- 动态库解析 --"
-        ldd /opt/easyaiot/RUNTIME/build/RUNTIME 2>/dev/null | grep -E "rknnrt|not found" || true
+        ldd /opt/easyaiot/RUNTIME/build/RUNTIME 2>/dev/null | grep -E "rknnrt|rockchip_mpp|drm|not found" || true
     ' 2>&1)" || { error "  docker exec 失败"; return 1; }
     echo "$out" | sed 's/^/  /'
     echo "$out" | grep -q 'librknnrt.so' \
@@ -719,6 +1096,13 @@ verify_container_side() {
         && { error "  容器内有未解析的依赖库（见上方 not found）"; rc=1; }
     echo "$out" | grep -Eq '/dev/(rga|rknpu|mpp_service|dri/renderD)' \
         || { error "  容器内没有 NPU/MPP 设备节点：重建容器时确认 override 生效"; rc=1; }
+    # rkmpp 后端是「直接链接」，不像 RKNN 那样 dlopen 失败可回落：
+    # 容器里解析不到 librockchip_mpp 就是整个 RUNTIME 起不来，必须硬失败。
+    if echo "$out" | grep -q 'librockchip_mpp.so.*not found'; then
+        error "  容器内解析不到 librockchip_mpp：RUNTIME 会直接起不来（不是回落软解）"
+        error "  先确认 $0 mpp-setup 产出过 RUNTIME/.mpp-sdk/lib，再 wire + restart"
+        rc=1
+    fi
     # 硬证据：容器里真跑一次 rknn_init。上面的 ls/grep 只能证明「文件在」，
     # 证明不了设备可访问（缺 card 主节点时 ls 一样是干净的）。
     local cmodel
@@ -764,8 +1148,23 @@ verify_services() {
     local inis
     inis="$(ls "$SCRIPT_DIR"/RUNTIME/config/task_*.ini 2>/dev/null || true)"
     if [ -n "$inis" ]; then
-        info "  当前任务的推理后端配置（由 VIDEO 控制面写入）："
-        grep -H -E '^\s*(infer_backend|npu_core_mask|model_path)' $inis 2>/dev/null | sed 's/^/    /' || true
+        info "  当前任务的推理/编解码后端配置（由 VIDEO 控制面写入）："
+        grep -H -E '^\s*(infer_backend|npu_core_mask|model_path|hwaccel|hwaccel_decode|hwaccel_encode)' \
+            $inis 2>/dev/null | sed 's/^/    /' || true
+        # RKNN 只解决推理；hwaccel 没写成 rkmpp 说明视频链路可能还在吃 CPU
+        if runtime_has_mpp; then
+            if grep -l -E '^[[:space:]]*hwaccel[[:space:]]*=[[:space:]]*rkmpp' $inis >/dev/null 2>&1; then
+                success "  已有任务配置 hwaccel=rkmpp（rkvdec 硬解 + VEPU 硬编）"
+            elif grep -l -E '^[[:space:]]*hwaccel[[:space:]]*=[[:space:]]*none' $inis >/dev/null 2>&1; then
+                warn "  有任务配置 hwaccel=none：编解码全走 CPU，libx264 会吃掉 30-40 % 算力"
+                warn "  清掉 VIDEO 里的 RUNTIME_HWACCEL / RUNTIME_FORCE_SOFT_AV 后重建任务"
+            elif grep -l -E '^[[:space:]]*hwaccel[[:space:]]*=' $inis >/dev/null 2>&1; then
+                info "  任务配置为 hwaccel=auto（RUNTIME 自行探测 rkmpp）；功能正常，但建议显式 rkmpp"
+            else
+                warn "  RUNTIME 带 rkmpp 后端，但任务 ini 里没有 hwaccel —— VIDEO 控制面版本过旧"
+                warn "  重启 video-service 让新版 runtime_config_service 生效后重建任务"
+            fi
+        fi
     else
         info "  暂无 task_*.ini：下发一个 RKNN 模型的算法任务后再跑 verify"
     fi
@@ -807,6 +1206,8 @@ verify_all() {
     else
         error "校验未通过，按上面的 [ERROR] 逐项处理"
     fi
+    info "逐条取证（三处 NPU 判据是否同源 / 白名单是否真透传 / rkmpp 编解码链路）："
+    info "  bash RUNTIME/scripts/verify_rk_media.sh --container=video-service"
     return "$rc"
 }
 
@@ -834,6 +1235,19 @@ runtime_bundle() {
     elif [ -x "$bin" ]; then
         warn "  $bin 未链接 librknnrt：该包是在缺 SDK 的环境下编的，盒子只能跑 CPU"
         warn "  重出包（x86 上把 aarch64 SDK 放 RUNTIME/.rknn-sdk）：RUNTIME_WITH_RKNN=on bash RUNTIME/scripts/export_runtime_os_container.sh ubuntu24"
+    fi
+    # 离线包是「直接链接」rkmpp 的话，包里必须自带那份改过版本节点的库，
+    # 否则盒子上的 RUNTIME 会连启动都启动不了（不是回落软解）。
+    if binary_links_mpp "$bin"; then
+        if compgen -G "$dest/mpp-lib/librockchip_mpp.so*" >/dev/null 2>&1 \
+           || compgen -G "$dest/.mpp-sdk/lib/librockchip_mpp.so*" >/dev/null 2>&1; then
+            success "  $bin 已带 rkmpp 后端，且包内含 librockchip_mpp"
+        else
+            error "  $bin 链接了 librockchip_mpp，但离线包里没有这份库 —— 装到节点上 RUNTIME 会起不来"
+            error "  补法：把盒子上 RUNTIME/.mpp-sdk/lib 的内容打进包的 RUNTIME/mpp-lib/（$0 mpp-setup 的产物）"
+        fi
+    elif [ -x "$bin" ]; then
+        warn "  $bin 未链接 librockchip_mpp：编解码走 CPU（1080p25 约吃 1.5 个 A76）"
     fi
     # 注意：standalone 形态下 VIDEO 挂的是 RUNTIME/deploy.env 里的 RUNTIME_HOST_DIR/build/RUNTIME，
     # 与离线包的 $dest/bin/RUNTIME 不是同一份；两者只会用其中一份。
@@ -873,8 +1287,8 @@ EOF
 }
 
 usage() {
-    # 头部注释块为 2-36 行（36 行为收尾的 # ===），改注释时同步这里
-    sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,2\} \{0,1\}//'
+    # 头部注释块为 2-47 行（47 行为收尾的 # ===），改注释时同步这里
+    sed -n '2,47p' "${BASH_SOURCE[0]}" | sed 's/^#\{1,2\} \{0,1\}//'
 }
 
 run_container_cmd() {
@@ -890,6 +1304,7 @@ main() {
         doctor)   doctor_all ;;
         npu)      npu_snapshot ;;
         sdk-setup) sdk_setup ;;
+        mpp-setup) mpp_setup ;;
         build)    export_rknn_env && build_images && wire_npu_mount && verify_host_side ;;
         install)  export_rknn_env && install_all && verify_all ;;
         update)   export_rknn_env && update_all ;;

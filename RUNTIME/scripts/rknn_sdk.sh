@@ -112,6 +112,10 @@ librknnrt_version() {
 # /dev/dri 除了 renderD*（MPP/RGA 解码要用）之外，还必须带上 RKNPU 的 card 主节点：
 # RK3588 实测 librknnrt 打开的是 /dev/dri/card1（见 VIDEO/scripts/npu_drm_nodes.sh 的说明），
 # 漏掉它会让容器内 rknn_init 稳定失败在「failed to open rknn device」。
+#
+# /dev/dma_heap/* 是给 rkmpp 编解码用的：MppEnv 的 buffer group 按 DRM -> DMA_HEAP -> NORMAL
+# 顺序探测，宿主上没有 DRM 时全靠 system/ion 这两个 heap 节点。缺了它们 mpp_buffer_group
+# 只能退回 NORMAL（多一次 memcpy），个别内核版本上 get_internal(DMA_HEAP) 直接失败。
 npu_device_nodes() {
   local helper node seen=" "
   local -a card_nodes=()
@@ -128,8 +132,8 @@ npu_device_nodes() {
       break
     fi
   done
-  for node in /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service \
-              /dev/dri/renderD* ${card_nodes[@]+"${card_nodes[@]}"}; do
+  for node in /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service /dev/vpu_service \
+              /dev/dma_heap/* /dev/dri/renderD* ${card_nodes[@]+"${card_nodes[@]}"}; do
     [[ -e "$node" ]] || continue
     case "$seen" in *" $node "*) continue ;; esac
     seen="${seen}${node} "

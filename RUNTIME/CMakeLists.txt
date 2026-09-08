@@ -42,6 +42,53 @@ else()
     message(STATUS "RKNN: backend disabled (RUNTIME_WITH_RKNN=OFF)")
 endif()
 
+# Optional: Rockchip MPP codec backend (rkvdec hardware decode + VEPU hardware
+# encode) for RK3588 / RK356x. Needs the vendor librockchip_mpp plus its headers:
+# neither FFmpeg build on an RK3588 board is configured with --enable-rkmpp, so
+# the runtime drives MPP directly instead of going through avcodec.
+option(RUNTIME_WITH_MPP "Build the Rockchip rkmpp hardware codec backend" OFF)
+set(MPP_SDK_ROOT "" CACHE PATH "MPP SDK root (include/rockchip/ + lib/)")
+find_path(MPP_INCLUDE_DIR NAMES rockchip/rk_mpi.h
+    HINTS ${MPP_SDK_ROOT}/include ${MPP_SDK_ROOT}
+    PATHS /usr/include /usr/local/include)
+# Vendor trees also hand over the header directory itself (/usr/include/rockchip);
+# <rockchip/rk_mpi.h> then needs its parent on the include path.
+if(NOT MPP_INCLUDE_DIR)
+    find_path(MPP_ROCKCHIP_HEADER_DIR NAMES rk_mpi.h
+        HINTS ${MPP_SDK_ROOT}/include/rockchip ${MPP_SDK_ROOT}/rockchip
+        PATHS /usr/include/rockchip /usr/local/include/rockchip)
+    if(MPP_ROCKCHIP_HEADER_DIR)
+        get_filename_component(MPP_INCLUDE_DIR "${MPP_ROCKCHIP_HEADER_DIR}" DIRECTORY)
+    endif()
+endif()
+find_library(MPP_LIBRARY NAMES rockchip_mpp
+    HINTS ${MPP_SDK_ROOT}/lib ${MPP_SDK_ROOT}
+    PATHS /usr/lib /usr/local/lib /usr/lib/aarch64-linux-gnu
+          /usr/local/lib/aarch64-linux-gnu /oem/usr/lib)
+if(NOT MPP_LIBRARY)
+    # Board rootfses ship the versioned SONAME only, with no dev symlink. Passing
+    # the full path to the linker makes DT_NEEDED take that SONAME, which is what
+    # the container sees at runtime.
+    find_file(MPP_LIBRARY_FILE NAMES librockchip_mpp.so.0 librockchip_mpp.so.1 librockchip_mpp.so
+        HINTS ${MPP_SDK_ROOT}/lib ${MPP_SDK_ROOT}
+        PATHS /usr/lib /usr/local/lib /usr/lib/aarch64-linux-gnu
+              /usr/local/lib/aarch64-linux-gnu /usr/lib64 /oem/usr/lib)
+    if(MPP_LIBRARY_FILE)
+        set(MPP_LIBRARY ${MPP_LIBRARY_FILE})
+    endif()
+endif()
+if(RUNTIME_WITH_MPP)
+    if(NOT MPP_INCLUDE_DIR OR NOT MPP_LIBRARY)
+        message(FATAL_ERROR
+            "RUNTIME_WITH_MPP=ON but rockchip/rk_mpi.h / librockchip_mpp were not found. "
+            "Run ./install_rk3588.sh mpp-setup on the board, or pass "
+            "-DMPP_SDK_ROOT=<dir with include/rockchip + lib/> or -DMPP_INCLUDE_DIR=... -DMPP_LIBRARY=...")
+    endif()
+    message(STATUS "MPP: include=${MPP_INCLUDE_DIR} lib=${MPP_LIBRARY}")
+else()
+    message(STATUS "MPP: backend disabled (RUNTIME_WITH_MPP=OFF)")
+endif()
+
 find_package(OpenCV REQUIRED)
 message(STATUS "OpenCV: ${OpenCV_INCLUDE_DIRS}")
 message(STATUS "OpenCV version: ${OpenCV_VERSION}")
@@ -102,6 +149,9 @@ list(FILTER Src_SOURCES EXCLUDE REGEX ".*YoloEngine_Fixed\\.cpp$")
 if(NOT RUNTIME_WITH_RKNN)
     list(FILTER Src_SOURCES EXCLUDE REGEX ".*RknnEngine\\.cpp$")
 endif()
+if(NOT RUNTIME_WITH_MPP)
+    list(FILTER Src_SOURCES EXCLUDE REGEX "/src/mpp/")
+endif()
 
 add_executable(${PROJECT_NAME} ${Src_SOURCES})
 
@@ -147,6 +197,12 @@ if(RUNTIME_WITH_RKNN)
     target_include_directories(${PROJECT_NAME} PRIVATE ${RKNN_INCLUDE_DIR})
     target_link_libraries(${PROJECT_NAME} ${RKNN_RUNTIME_LIBRARY})
     target_compile_definitions(${PROJECT_NAME} PRIVATE RUNTIME_WITH_RKNN=1)
+endif()
+
+if(RUNTIME_WITH_MPP)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${MPP_INCLUDE_DIR})
+    target_link_libraries(${PROJECT_NAME} ${MPP_LIBRARY})
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RUNTIME_WITH_MPP=1)
 endif()
 
 # Version string injected by install/build scripts (e.g. 0.1.0+gabcdef)

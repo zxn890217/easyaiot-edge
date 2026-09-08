@@ -112,6 +112,32 @@ if [[ -n "${RKNN_SDK_ROOT:-}" ]]; then
 fi
 echo "[RUNTIME/container] rknn: ${rknn_args[*]:-auto(off)}"
 
+# Rockchip MPP（rkvdec 硬解 + VEPU 硬编）：同 RKNN 的套路，开关与 SDK 根目录由宿主机给，
+# 容器里必须能看到 rockchip/rk_mpi.h 与一份「容器能链得动」的 librockchip_mpp。
+# 后者已在宿主机被 install_rk3588.sh mpp-setup 重定向过 GLIBC_2.29 -> GLIBC_2.17，
+# 没做这一步的 SDK 直接拿来链接会在 ld 阶段报 version `GLIBC_2.29' not found。
+mpp_args=()
+case "$(printf '%s' "${RUNTIME_WITH_MPP:-auto}" | tr '[:upper:]' '[:lower:]')" in
+  off|0|false|no)
+    mpp_args+=(-DRUNTIME_WITH_MPP=OFF)
+    ;;
+  on|1|true|yes)
+    mpp_args+=(-DRUNTIME_WITH_MPP=ON)
+    ;;
+  *)
+    if [[ -f "${MPP_SDK_ROOT:-}/include/rockchip/rk_mpi.h" ]] \
+       || [[ -f "${MPP_SDK_ROOT:-}/rockchip/rk_mpi.h" ]] \
+       || [[ -f /usr/include/rockchip/rk_mpi.h ]]; then
+      echo "[RUNTIME/container] 容器内发现 rk_mpi.h，启用 rkmpp 硬件编解码后端"
+      mpp_args+=(-DRUNTIME_WITH_MPP=ON)
+    fi
+    ;;
+esac
+if [[ -n "${MPP_SDK_ROOT:-}" ]]; then
+  mpp_args+=(-DMPP_SDK_ROOT="$MPP_SDK_ROOT")
+fi
+echo "[RUNTIME/container] mpp: ${mpp_args[*]:-auto(off)}"
+
 "$CMAKE_BIN" "$RUNTIME_SRC" \
   -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -123,6 +149,7 @@ echo "[RUNTIME/container] rknn: ${rknn_args[*]:-auto(off)}"
   -DONNXRUNTIME_ROOT="$ORT_ROOT" \
   -DRUNTIME_VERSION_STR="${RUNTIME_VERSION_STR}" \
   ${rknn_args[@]+"${rknn_args[@]}"} \
+  ${mpp_args[@]+"${mpp_args[@]}"} \
   -DCMAKE_CXX_FLAGS="-I$CONDA_PREFIX/include/opencv5"
 
 echo "[RUNTIME/container] 编译中 (-j$JOBS)..."

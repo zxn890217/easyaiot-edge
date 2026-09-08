@@ -10,6 +10,10 @@
 #include "RTMPEncoder.h"
 #include "YoloThreadPool.h"
 
+#ifdef RUNTIME_WITH_MPP
+#include "mpp/MppDecoder.h"
+#endif
+
 namespace runtime {
 
 namespace {
@@ -111,6 +115,16 @@ Pipeline::Pipeline(Config& config,
         hwState_.decodeEp = sharedHwState_->decodeEp.empty()
             ? (sharedHwState_->usingCuda ? "cuda" : "cpu")
             : sharedHwState_->decodeEp;
+        hwState_.usingMpp = sharedHwState_->usingMpp;
+        hwState_.codedWidth = sharedHwState_->codedWidth;
+        hwState_.codedHeight = sharedHwState_->codedHeight;
+        // Sole ownership of the rkvdec instance moves to the pull thread; Detech
+        // only reads decode_ep out of its copy. Unlike the CUDA hwdevice, an
+        // MppDecoder is plain new/delete, so leaving it in both structs would
+        // free it twice on shutdown.
+        hwState_.mpp = sharedHwState_->mpp;
+        sharedHwState_->mpp = nullptr;
+        sharedHwState_->usingMpp = false;
         setDecodeEp(hwState_.decodeEp);
     } else {
         setDecodeEp("cpu");
@@ -129,6 +143,9 @@ void Pipeline::setDecodeEp(const std::string& ep) {
     if (sharedHwState_) {
         sharedHwState_->decodeEp = decodeEp_;
         sharedHwState_->usingCuda = (decodeEp_ == "cuda");
+        // Reflects which engine is *active*; the rkvdec handle itself lives in
+        // hwState_ only (see the ctor), so callers must never touch mpp here.
+        sharedHwState_->usingMpp = (decodeEp_ == "rkmpp");
     }
 }
 
@@ -232,11 +249,13 @@ bool Pipeline::reopenStream(bool forceSoft) {
 
     AVCodecParameters* videoCodecPar = formatCtx_->streams[videoIndex_]->codecpar;
     const bool soft = forceSoft || forceSoftSession_ || config_.forceSoftAv;
+    const bool hwDecodeWanted = !soft && hwaccelDecodeEnabled(config_);
     if (!openVideoDecoder(&codecCtx_, videoCodecPar,
-                          config_.preferHwaccel && !soft,
-                          soft,
+                          hwDecodeWanted,
+                          !hwDecodeWanted,
                           config_.hwaccelDeviceId,
-                          &hwState_)) {
+                          &hwState_,
+                          config_.hwaccel)) {
         LOG(ERROR) << "[PIPELINE] openVideoDecoder failed";
         avformat_close_input(&formatCtx_);
         return false;
@@ -249,8 +268,10 @@ bool Pipeline::reopenStream(bool forceSoft) {
     } else {
         videoFps_ = stream->avg_frame_rate.num / stream->avg_frame_rate.den;
     }
-    videoWidth_ = codecCtx_->width;
-    videoHeight_ = codecCtx_->height;
+    // rkmpp never allocates an AVCodecContext, so the coded size comes from the
+    // demuxer parameters instead.
+    videoWidth_ = codecCtx_ ? codecCtx_->width : hwState_.codedWidth;
+    videoHeight_ = codecCtx_ ? codecCtx_->height : hwState_.codedHeight;
     LOG(INFO) << "[PIPELINE] reopened stream " << videoWidth_ << "x" << videoHeight_
               << "@" << videoFps_ << "fps decode_ep=" << decodeEp_;
     return true;
@@ -258,7 +279,9 @@ bool Pipeline::reopenStream(bool forceSoft) {
 
 void Pipeline::pullDecodeLoop() {
     LOG(INFO) << "[PIPELINE-PULL] thread started decode_ep=" << decodeEp_;
-    if (!formatCtx_ || !codecCtx_) {
+    // On the rkmpp path FFmpeg only demuxes, so there is no codec context.
+    const bool mppDecode = hwState_.usingMpp && hwState_.mpp != nullptr;
+    if (!formatCtx_ || (!codecCtx_ && !mppDecode)) {
         LOG(ERROR) << "[PIPELINE-PULL] FFmpeg not ready";
         running_.store(false);
         return;
@@ -279,7 +302,8 @@ void Pipeline::pullDecodeLoop() {
     av_image_fill_arrays(frameBGR->data, frameBGR->linesize, buffer, AV_PIX_FMT_BGR24,
                          videoWidth_, videoHeight_, 1);
 
-    AVPixelFormat swPixFmt = codecCtx_->pix_fmt;
+    // rkvdec always hands back NV12; the codec context is null on that path.
+    AVPixelFormat swPixFmt = mppDecode ? AV_PIX_FMT_NV12 : codecCtx_->pix_fmt;
     const bool initialCuda = hwState_.usingCuda || decodeEp_ == "cuda" ||
                              swPixFmt == AV_PIX_FMT_CUDA;
     if (swPixFmt == AV_PIX_FMT_CUDA || swPixFmt == AV_PIX_FMT_NONE || initialCuda) {
@@ -293,7 +317,7 @@ void Pipeline::pullDecodeLoop() {
         SWS_BILINEAR, nullptr, nullptr, nullptr);
 
     // Soft path with known host pix_fmt from codec
-    if (!initialCuda && codecCtx_->pix_fmt != AV_PIX_FMT_NONE &&
+    if (!mppDecode && !initialCuda && codecCtx_->pix_fmt != AV_PIX_FMT_NONE &&
         codecCtx_->pix_fmt != AV_PIX_FMT_CUDA) {
         if (swsCtx) {
             sws_freeContext(swsCtx);
@@ -354,6 +378,109 @@ void Pipeline::pullDecodeLoop() {
         return true;
     };
 
+    // One decoded picture, described the way sws_scale wants it, regardless of
+    // whether FFmpeg or rkvdec produced it.
+    struct DecodedPlanes {
+        const uint8_t* data[4] = {nullptr, nullptr, nullptr, nullptr};
+        int linesize[4] = {0, 0, 0, 0};
+        int format = AV_PIX_FMT_NONE;
+        int width = 0;
+        int height = 0;
+        int64_t pts = 0;
+    };
+
+    auto publishFrame = [&](const DecodedPlanes& src) {
+        if (src.format != swPixFmt || src.width != videoWidth_ || src.height != videoHeight_) {
+            videoWidth_ = src.width > 0 ? src.width : videoWidth_;
+            videoHeight_ = src.height > 0 ? src.height : videoHeight_;
+            if (!rebuildConverters(static_cast<AVPixelFormat>(src.format))) {
+                return;
+            }
+        }
+
+        FrameSlot* slot = framePool_.acquire();
+        if (!slot) {
+            int dropIdx = -1;
+            if (frameRing_.pop(dropIdx)) {
+                framePool_.release(dropIdx);
+                if (metrics_) {
+                    metrics_->framesDropped.fetch_add(1, std::memory_order_relaxed);
+                }
+                slot = framePool_.acquire();
+            }
+            if (!slot) {
+                return;
+            }
+        }
+
+        sws_scale(swsCtx, src.data, src.linesize, 0, videoHeight_,
+                  frameBGR->data, frameBGR->linesize);
+        cv::Mat temp(videoHeight_, videoWidth_, CV_8UC3, frameBGR->data[0], frameBGR->linesize[0]);
+        temp.copyTo(slot->bgr);
+
+        slot->seq = seqGen_.fetch_add(1, std::memory_order_relaxed) + 1;
+        slot->ptsNs = src.pts;
+        slot->captureNs = nowNs();
+        slot->width = videoWidth_;
+        slot->height = videoHeight_;
+        slot->format = PixelFormat::BGR24;
+
+        int discardedIdx = -1;
+        bool dropped = false;
+        frameRing_.pushDropOldest(slot->poolIndex, discardedIdx, &dropped);
+        if (dropped && discardedIdx >= 0) {
+            framePool_.release(discardedIdx);
+        }
+        if (metrics_) {
+            metrics_->framesDecoded.fetch_add(1, std::memory_order_relaxed);
+            if (dropped) {
+                metrics_->framesDropped.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+#ifdef RUNTIME_WITH_MPP
+    // rkvdec is asynchronous: it lags the input by a frame or two, so pictures
+    // surface both after a successful send() and while retrying a full input
+    // queue. Returns how many frames made it into the ring.
+    auto drainMppDecoder = [&](runtime::mpp::MppDecoder* dec) -> int {
+        int got = 0;
+        while (running_.load()) {
+            runtime::mpp::MppDecoder::Frame mf;
+            if (!dec->receive(&mf)) {
+                break;
+            }
+            DecodedPlanes src{};
+            src.data[0] = mf.planes[0];
+            src.data[1] = mf.planes[1];
+            src.linesize[0] = mf.linesize[0];
+            src.linesize[1] = mf.linesize[1];
+            src.format = AV_PIX_FMT_NV12;
+            src.width = mf.width;
+            src.height = mf.height;
+            src.pts = mf.pts;
+            publishFrame(src);
+            dec->release();
+            ++got;
+        }
+        return got;
+    };
+
+    auto downgradeFromMpp = [&](const char* why) {
+        if (forceSoftSession_) {
+            return;
+        }
+        LOG(WARNING) << "[PIPELINE-PULL] rkvdec " << why
+                     << ", downgrading to software decode";
+        forceSoftSession_ = true;
+        if (reopenStream(true)) {
+            rebuildConverters(hwState_.usingCuda
+                                  ? AV_PIX_FMT_NV12
+                                  : (codecCtx_ ? codecCtx_->pix_fmt : AV_PIX_FMT_YUV420P));
+        }
+    };
+#endif
+
     while (running_.load()) {
         int ret = av_read_frame(formatCtx_, packet);
         if (ret < 0) {
@@ -400,7 +527,10 @@ void Pipeline::pullDecodeLoop() {
                     break;
                 }
                 if (reopenStream(forceSoftSession_) &&
-                    rebuildConverters(hwState_.usingCuda ? AV_PIX_FMT_NV12 : codecCtx_->pix_fmt)) {
+                    rebuildConverters(hwState_.usingCuda || hwState_.usingMpp
+                                          ? AV_PIX_FMT_NV12
+                                          : (codecCtx_ ? codecCtx_->pix_fmt
+                                                       : AV_PIX_FMT_YUV420P))) {
                     packetsThisSession = 0;
                     hwTransferFailStreak_ = 0;
                     // Do NOT reset backoff here — wait until sustained packets
@@ -438,6 +568,40 @@ void Pipeline::pullDecodeLoop() {
             continue;
         }
 
+#ifdef RUNTIME_WITH_MPP
+        if (hwState_.usingMpp && hwState_.mpp) {
+            runtime::mpp::MppDecoder* dec = hwState_.mpp;
+            bool queued = false;
+            for (int pump = 0; pump < 4 && running_.load(); ++pump) {
+                bool retry = false;
+                if (dec->send(packet->data, static_cast<size_t>(packet->size),
+                              packet->pts, &retry)) {
+                    queued = true;
+                    break;
+                }
+                if (!retry) {
+                    break;  // hard error on this AU, rkvdec keeps its previous state
+                }
+                // Input ring full and nothing freed it: rkvdec is not keeping up.
+                if (drainMppDecoder(dec) == 0) {
+                    break;
+                }
+            }
+            av_packet_unref(packet);
+            if (!queued) {
+                if (dec->unsupported()) {
+                    downgradeFromMpp("rejected an access unit");
+                }
+                continue;
+            }
+            drainMppDecoder(dec);
+            if (dec->unsupported()) {
+                downgradeFromMpp("returned an unsupported picture format");
+            }
+            continue;
+        }
+#endif
+
         ret = avcodec_send_packet(codecCtx_, packet);
         av_packet_unref(packet);
         if (ret < 0) {
@@ -470,55 +634,16 @@ void Pipeline::pullDecodeLoop() {
             }
             hwTransferFailStreak_ = 0;
 
-            if (srcForSws->format != swPixFmt ||
-                srcForSws->width != videoWidth_ ||
-                srcForSws->height != videoHeight_) {
-                videoWidth_ = srcForSws->width > 0 ? srcForSws->width : videoWidth_;
-                videoHeight_ = srcForSws->height > 0 ? srcForSws->height : videoHeight_;
-                if (!rebuildConverters(static_cast<AVPixelFormat>(srcForSws->format))) {
-                    continue;
-                }
+            DecodedPlanes src{};
+            for (int i = 0; i < 4; ++i) {
+                src.data[i] = srcForSws->data[i];
+                src.linesize[i] = srcForSws->linesize[i];
             }
-
-            FrameSlot* slot = framePool_.acquire();
-            if (!slot) {
-                int dropIdx = -1;
-                if (frameRing_.pop(dropIdx)) {
-                    framePool_.release(dropIdx);
-                    if (metrics_) {
-                        metrics_->framesDropped.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    slot = framePool_.acquire();
-                }
-                if (!slot) {
-                    continue;
-                }
-            }
-
-            sws_scale(swsCtx, srcForSws->data, srcForSws->linesize, 0, videoHeight_,
-                      frameBGR->data, frameBGR->linesize);
-            cv::Mat temp(videoHeight_, videoWidth_, CV_8UC3, frameBGR->data[0], frameBGR->linesize[0]);
-            temp.copyTo(slot->bgr);
-
-            slot->seq = seqGen_.fetch_add(1, std::memory_order_relaxed) + 1;
-            slot->ptsNs = frame->pts;
-            slot->captureNs = nowNs();
-            slot->width = videoWidth_;
-            slot->height = videoHeight_;
-            slot->format = PixelFormat::BGR24;
-
-            int discardedIdx = -1;
-            bool dropped = false;
-            frameRing_.pushDropOldest(slot->poolIndex, discardedIdx, &dropped);
-            if (dropped && discardedIdx >= 0) {
-                framePool_.release(discardedIdx);
-            }
-            if (metrics_) {
-                metrics_->framesDecoded.fetch_add(1, std::memory_order_relaxed);
-                if (dropped) {
-                    metrics_->framesDropped.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
+            src.format = srcForSws->format;
+            src.width = srcForSws->width;
+            src.height = srcForSws->height;
+            src.pts = frame->pts;
+            publishFrame(src);
         }
     }
 

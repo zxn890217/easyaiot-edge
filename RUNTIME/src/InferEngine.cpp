@@ -10,6 +10,15 @@
 #endif
 
 #ifdef __linux__
+#include <dirent.h>
+
+#include <algorithm>
+#include <cctype>
+#include <climits>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
 #include <dlfcn.h>
 #include <unistd.h>
 #endif
@@ -17,16 +26,95 @@
 namespace {
 
 #ifdef RUNTIME_WITH_RKNN
-/** Candidate NPU device nodes across rknpu/rknpu2 kernel drivers. */
+#ifdef __linux__
+/**
+ * NPU-only evidence. Never list shared accelerators here.
+ *
+ * /dev/rga and /dev/dri/renderD128 used to be candidates and both were wrong:
+ * RGA is the 2D blitter, renderD128 belongs to the rockchip-drm display core.
+ * A container that mounts exactly the rkmpp decode set (/dev/mpp_service,
+ * /dev/rga, /dev/dri/renderD128) was therefore declared "NPU present", picked
+ * the rknn engine for want of a better signal and then died inside
+ * rknn_init(). The RKNPU DRM card master node is handled separately below.
+ */
 const char* kNpuDevices[] = {
-    "/dev/rga",
-    "/dev/dri/renderD128",
     "/dev/rknpu",
-    "/sys/class/devfreq/fdab0000.npu",
-    "/sys/class/devfreq/ff800000.npu",
+    "/dev/rknpu_ll",
+    "/sys/class/devfreq/fdab0000.npu",  // RK3588
+    "/sys/class/devfreq/ff800000.npu",  // RK356x / RK3576
     nullptr,
 };
-#endif
+
+std::string toLowerStr(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return out;
+}
+
+bool realPathOf(const std::string& path, std::string& out) {
+    char buf[PATH_MAX];
+    if (!::realpath(path.c_str(), buf)) {
+        return false;
+    }
+    out.assign(buf);
+    return true;
+}
+
+/** Same predicate as VIDEO/scripts/npu_drm_nodes.sh. */
+bool looksLikeRknpu(const std::string& hay) {
+    return hay.find("rknpu") != std::string::npos || hay.find("rknn") != std::string::npos
+        || hay.find(".npu") != std::string::npos || hay.find("/npu") != std::string::npos;
+}
+
+/**
+ * /dev/dri/card* master nodes owned by the RKNPU DRM driver.
+ *
+ * Measured on RK3588 (rknpu 0.9.8 + librknnrt 2.3.0): rknn_init() ends up with
+ * an fd on /dev/dri/card1 (226:1, sysfs driver name RKNPU) - not on a
+ * renderD12x node. renderD* is deliberately *not* treated as NPU evidence
+ * because the display core exposes one too.
+ */
+std::vector<std::string> npuDrmCardNodes() {
+    std::vector<std::string> nodes;
+    DIR* dir = opendir("/sys/class/drm");
+    if (!dir) {
+        return nodes;
+    }
+    while (dirent* entry = readdir(dir)) {
+        const std::string name(entry->d_name);
+        if (name.compare(0, 4, "card") != 0) {
+            continue;
+        }
+        const std::string index = name.substr(4);
+        if (index.empty() || index.find_first_not_of("0123456789") != std::string::npos) {
+            continue;  // card0-HDMI-A-1 etc. are connectors, not the base device
+        }
+        const std::string sysfs = "/sys/class/drm/" + name;
+        std::string driver;
+        std::string devpath;
+        realPathOf(sysfs + "/device/driver", driver);
+        realPathOf(sysfs, devpath);
+        // Both the bound driver basename and the sysfs path are matched: vendor
+        // kernels register it as rknpu / rockchip-rknpu while the platform path
+        // carries the node name (fe440000.npu). rockchip-drm matches neither.
+        if (!looksLikeRknpu(toLowerStr(driver + " " + devpath))) {
+            continue;
+        }
+        const std::string node = "/dev/dri/" + name;
+        if (::access(node.c_str(), R_OK | W_OK) == 0) {
+            nodes.push_back(node);
+        }
+    }
+    closedir(dir);
+    std::sort(nodes.begin(), nodes.end());
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    return nodes;
+}
+#endif  // __linux__
+#endif  // RUNTIME_WITH_RKNN
 
 }  // namespace
 
@@ -68,7 +156,15 @@ bool hostHasRknn() {
                 return true;
             }
         }
-        LOG(WARNING) << "[INFER] librknnrt.so present but no NPU device node was found";
+        // rknpu v2 (RK3588 & co.) has no /dev/rknpu: the driver is reached through
+        // the RKNPU DRM *card* master node. Missing this is what made an
+        // NPU-capable host look like a CPU-only one.
+        for (const std::string& node : npuDrmCardNodes()) {
+            LOG(INFO) << "[INFER] RKNN NPU detected via " << node << " (RKNPU DRM card node)";
+            return true;
+        }
+        LOG(WARNING) << "[INFER] librknnrt.so present but no NPU device node was found "
+                     << "(checked /dev/rknpu*, the *.npu devfreq dirs and /sys/class/drm/card*)";
         return false;
     }();
     return cached;

@@ -74,6 +74,10 @@ DEVICE/server
 .scripts/docker/.web_deploy_profile_built
 RUNTIME/deploy.env
 RUNTIME/VERSION
+# RK3588 盒子本地暂存的厂商 SDK（install_rk3588.sh sdk-setup / mpp-setup 产物，
+# 里面是从宿主 rootfs 拷来并改过 GLIBC 版本节点的厂商二进制，不进版本库）
+RUNTIME/.rknn-sdk/
+RUNTIME/.mpp-sdk/
 WEB/conf/_app.config.js
 
 # 部署期运行时数据目录（deploy/）

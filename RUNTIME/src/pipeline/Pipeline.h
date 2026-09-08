@@ -58,7 +58,7 @@ public:
     void join();
     bool isRunning() const { return running_.load(); }
 
-    /** cuda | cpu — updated after reopen / downgrade */
+    /** cuda | rkmpp | cpu — updated after reopen / downgrade */
     std::string decodeEp() const { return decodeEp_; }
 
     /** True if pull loop stopped because a finite file/VOD hit EOF. */

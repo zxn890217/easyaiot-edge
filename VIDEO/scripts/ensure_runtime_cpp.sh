@@ -102,6 +102,30 @@ wire_runtime_override() {
     cuda_volume_line="      - ${cuda_host}:/opt/easyaiot/cuda-lib:ro"
   fi
 
+  # Rockchip MPP（rkvdec 硬解 / VEPU 硬编）：RUNTIME 直连 librockchip_mpp，
+  # 缺库时不是「回落软解」而是整个 RUNTIME 起不来（直接链接的二进制，加载期解析失败）。
+  #
+  # 只用 install_rk3588.sh mpp-setup 暂存的那份，不用宿主 /usr/lib 里的原件：
+  #   1) 板上原件的 .gnu.version_r 挂着 GLIBC_2.29，容器（AlmaLinux 8.10 / glibc 2.28）
+  #      链不动也加载不动 —— 暂存那份已被 mpp_glibc_patch 重定向到 GLIBC_2.17。
+  #   2) 挂整个宿主系统库目录会顶掉容器里的 libc/libstdc++（与上面 CUDA/RKNN 的顾虑同理）。
+  # 暂存目录就在 RUNTIME/.mpp-sdk/lib，而 RUNTIME_HOST_DIR 已经整体挂到
+  # /opt/easyaiot/RUNTIME:ro，所以这里只需把路径加进 LD_LIBRARY_PATH，不必新增 volume。
+  # 目录里那几个补进来的传递依赖（libdrm.so.2 等）是 container_has_lib 判定「容器没有」
+  # 才搬的，因此不会遮蔽容器自带的库。
+  local mpp_ld_path="" cand
+  for cand in "${RUNTIME_HOST_DIR}/.mpp-sdk/lib" "${RUNTIME_HOST_DIR}/mpp-lib"; do
+    if compgen -G "${cand}/librockchip_mpp.so*" >/dev/null 2>&1; then
+      mpp_ld_path="/opt/easyaiot/RUNTIME/.mpp-sdk/lib"
+      [[ "$cand" == "${RUNTIME_HOST_DIR}/mpp-lib" ]] && mpp_ld_path="/opt/easyaiot/RUNTIME/mpp-lib"
+      break
+    fi
+  done
+  if [[ -n "$mpp_ld_path" ]]; then
+    ld_path="${ld_path}:${mpp_ld_path}"
+    print_info "检测到 rkmpp 运行库 ($mpp_ld_path)，已为 VIDEO 容器开启硬解/硬编通路"
+  fi
+
   # Rockchip NPU (RK3588/RK356x): mount librknnrt.so + the device nodes the driver needs.
   # Only exist-verified nodes are added, otherwise docker-compose fails to start the service.
   #
@@ -124,7 +148,15 @@ wire_runtime_override() {
   local -a device_nodes=()
   local -a npu_card_nodes=()
   local node render npu_card
-  for node in /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service; do
+  # /dev/vpu_service：老厂商内核（4.4 早期）里 MPP 的入口叫这个名，新内核统一为 mpp_service。
+  # /dev/dma_heap/*：MppEnv 的 buffer group 按 DRM -> DMA_HEAP -> NORMAL 顺序探测，
+  #   没有 DRM 时全靠 system/ion 这两个 heap 节点导出 DMA-BUF；缺了它们只能退回 NORMAL
+  #   （每帧多一次 memcpy），个别内核上 get_internal(DMA_HEAP) 直接失败。
+  #   目录里通常是 3~6 个节点，逐个 -e 判定后再加，避免 docker-compose 因不存在的节点报错。
+  for node in /dev/rga /dev/rknpu /dev/rknpu_ll /dev/mpp_service /dev/vpu_service; do
+    if [[ -e "$node" ]]; then device_nodes+=("$node"); fi
+  done
+  for node in /dev/dma_heap/*; do
     if [[ -e "$node" ]]; then device_nodes+=("$node"); fi
   done
   for render in /dev/dri/renderD*; do
