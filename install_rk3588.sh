@@ -1106,12 +1106,31 @@ verify_container_side() {
         echo "-- librockchip_mpp --"
         emit "（容器内未找到）" ls -1 /opt/easyaiot/RUNTIME/.mpp-sdk/lib/librockchip_mpp.so*
         echo "-- MPP SoC 探测 --"
-        # MPP 靠 /proc/device-tree/compatible 认 rk3588；docker 默认用 tmpfs 盖住容器里的
-        # /sys（只单独透出 /sys/fs/cgroup），所以那个符号链接在容器内是悬空的。
+        # MPP 靠 /proc/device-tree/compatible 认 rk3588。/proc/device-tree 是指向
+        # /sys/firmware/devicetree/base 的绝对符号链接；docker 默认 maskPaths 含
+        # /sys/firmware（空的只读 tmpfs，在业务卷之后套），往它下面 bind 也会被盖掉，
+        # 所以非 privileged 容器里这条链必断。正解是 privileged（runc 不套 maskPaths）。
         if [ -r /proc/device-tree/compatible ]; then
             tr "\0" " " < /proc/device-tree/compatible; echo ""
         else
             echo "DTREE_MISSING（容器内读不到 /proc/device-tree/compatible）"
+            # 三件套取证（用自打的 ABSENT 标记，不 grep ls 的报错文案——容器 locale
+            # 一变那些字就翻成中文，判据跟着失效）。板上实测样例（docker 28.1.1）：
+            #   link: lrwxrwxrwx ... -> /sys/firmware/devicetree/base
+            #   bind: ABSENT + mnt:  有 devicetree 行  <- bind 被 /sys/firmware 的 mask 盖住
+            #   link ABSENT                            <- 内核没编 CONFIG_PROC_DEVICETREE
+            #   bind ABSENT + mnt 无行                 <- 设备树没进容器（旧 override/没重建）
+            if [ -L /proc/device-tree ] || [ -e /proc/device-tree ]; then
+                ls -l /proc/device-tree 2>&1 | sed "s|^|    link: |"
+            else
+                echo "    link: ABSENT"
+            fi
+            if [ -e /sys/firmware/devicetree/base/compatible ]; then
+                ls -l /sys/firmware/devicetree/base/compatible 2>&1 | sed "s|^|    bind: |"
+            else
+                echo "    bind: ABSENT"
+            fi
+            grep devicetree /proc/self/mountinfo 2>/dev/null | sed "s|^|    mnt:  |"
         fi
         echo "-- RUNTIME --"
         if [ -x /opt/easyaiot/RUNTIME/build/RUNTIME ]; then
@@ -1135,12 +1154,10 @@ verify_container_side() {
         || { error "  容器内没有 NPU/MPP 设备节点：重建容器时确认 override 生效"; rc=1; }
     if echo "$out" | grep -q 'DTREE_MISSING'; then
         error "  容器内读不到设备树 —— MPP 认不出 SoC，rkvdec/VEPU 的平台匹配会失败"; rc=1
-        # 三级取证：宿主有没有 → 生成的 override 里有没有 → 跑着的容器挂上没挂上。
-        # 缺哪一级就停在哪儿：探测失败 / wire 没重跑 / 容器没重建。
         local dt_ovr="$SCRIPT_DIR/VIDEO/.docker-compose.runtime.override.yaml"
         # 宿主上这两条要分开看：MPP 读的是 /proc/device-tree（内核 procfs 建的符号链接），
         # wire 探测的是 /sys/firmware/devicetree/base（真实目录）。前者不通说明内核没编
-        # CONFIG_PROC_DEVICETREE —— 挂设备树也救不了，宿主上 MPP 同样认不出 SoC。
+        # CONFIG_PROC_DEVICETREE —— 容器怎么挂都救不了，宿主上 MPP 同样认不出 SoC。
         if [ -r /proc/device-tree/compatible ]; then
             info "  宿主 /proc/device-tree/compatible 可读：$(tr '\0' ' ' < /proc/device-tree/compatible)"
         elif [ -r /sys/firmware/devicetree/base/compatible ]; then
@@ -1148,21 +1165,30 @@ verify_container_side() {
             error "  这种情况下挂进容器也没用：MPP 只读 /proc/device-tree，宿主上同样认不出 SoC"
         else
             error "  宿主自己也读不到 /sys/firmware/devicetree/base/compatible"
-            error "  这块板的内核没把设备树暴露出来（或不是 DT 启动），wire 里那段挂载判定会主动跳过；"
-            error "  MPP 只能按 RUNTIME 显式指定的 codec 工作，硬解是否真通要看 RUNTIME/scripts/verify_rk_media.sh"
+            error "  这块板的内核没把设备树暴露出来（或不是 DT 启动）；"
+            error "  硬解是否真通要看 RUNTIME/scripts/verify_rk_media.sh 的实测"
         fi
-        if [ -f "$dt_ovr" ] && grep -q '/sys/firmware/devicetree' "$dt_ovr"; then
-            info "  override 里已有设备树挂载：只差重建容器，$0 restart（内部 up -d --force-recreate）"
+        # 板上实测（docker 28.1.1）：往容器里 bind /sys/firmware/devicetree/base 无效 ——
+        # docker 默认 maskPaths 用一个空的只读 tmpfs 盖住 /sys/firmware，且套在业务卷
+        # 之后，.Mounts/mountinfo 记录都在、容器内 ls 仍报 ENOENT。正解是 privileged
+        # （runc 对 privileged 容器不套 maskPaths），新版 ensure_runtime_cpp.sh 已相应
+        # 改成写 privileged: true 并撤掉那条 devicetree bind。
+        local priv
+        priv="$(docker inspect "$VIDEO_CONTAINER" --format '{{.HostConfig.Privileged}}' 2>/dev/null || true)"
+        if [ "$priv" = "true" ]; then
+            if echo "$out" | grep -q 'link: ABSENT'; then
+                error "  容器已是 privileged，但 /proc 里连 device-tree 链接都没有 —— 内核未开 CONFIG_PROC_DEVICETREE"
+                error "  挂载救不了；MPP 只能按 RUNTIME 显式指定的 codec 跑，硬解实测见 verify_rk_media.sh"
+            else
+                error "  容器已 privileged 却仍读不到 —— 超出已知场景，请把上面 link:/bind:/mnt: 三行贴回来分析"
+            fi
+        elif [ -f "$dt_ovr" ] && grep -qE '^[[:space:]]*privileged:[[:space:]]*true' "$dt_ovr"; then
+            info "  override 已含 privileged: true，只差重建容器：$0 restart（内部 up -d --force-recreate）"
+        elif [ -f "$dt_ovr" ] && grep -q '/sys/firmware/devicetree' "$dt_ovr"; then
+            info "  override 还是旧的 devicetree bind 挂载 —— 会被 maskPaths 盖住，新 docker 上实测无效"
+            info "  用新版脚本重新生成 override：bash VIDEO/scripts/ensure_runtime_cpp.sh wire && $0 restart"
         else
-            info "  override 里没有设备树挂载：确认板上脚本是新版，再 bash VIDEO/scripts/ensure_runtime_cpp.sh wire"
-        fi
-        if docker inspect "$VIDEO_CONTAINER" \
-                --format '{{range .Mounts}}{{.Source}}->{{.Destination}};{{end}}' 2>/dev/null \
-                | grep -q devicetree; then
-            info "  容器已挂载但仍读不到：容器内看 ls /sys/firmware/devicetree/base | head，"
-            info "  以及 ls -l /proc/device-tree（内核没编 CONFIG_PROC_DEVICETREE 时这个链接本身就不存在）"
-        else
-            info "  运行中的容器没有该挂载：$0 restart"
+            info "  override 里没有 privileged：确认板上脚本是新版，再 bash VIDEO/scripts/ensure_runtime_cpp.sh wire，然后 $0 restart"
         fi
     fi
     # rkmpp 后端是「直接链接」，不像 RKNN 那样 dlopen 失败可回落：
@@ -1203,8 +1229,20 @@ verify_container_side() {
 verify_services() {
     step "服务健康"
     local rc=0
-    if curl -sf http://127.0.0.1:6000/actuator/health >/dev/null 2>&1; then
+    # 别用 curl -sf：/actuator/health 由 healthcheck 库实现，任一 check 失败就返回非 2xx
+    # （例如数据库那条 check 挂了给 500）。-f 把「端口没听」和「健康检查报错」压成同一个
+    # 退出码，于是一条明明在监听、只是 DB check 失败的服务会被报成「不可达」。
+    # 这里把状态码和响应体分开取，响应体会点名是哪条 check 挂的。
+    local resp code body
+    resp="$(curl -s -m 5 -w '\n%{http_code}' http://127.0.0.1:6000/actuator/health 2>/dev/null || true)"
+    code="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+    if [ "$code" = "200" ]; then
         success "  VIDEO /actuator/health OK"
+    elif [ -n "$code" ] && [ "$code" != "000" ]; then
+        error "  VIDEO :6000 在听，但 /actuator/health 返回 HTTP $code"; rc=1
+        printf '%s\n' "$body" | head -c 400
+        echo ""
     else
         error "  VIDEO :6000 健康检查不可达"; rc=1
         # 容器 running 但端口没起来，属应用侧启动失败（不是 NPU/编解码配置问题）。
